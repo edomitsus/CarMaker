@@ -1,0 +1,30 @@
+# Simulation output
+SimOutput/
+Movie/
+
+# Build output
+build/
+Build/
+Debug/
+Release/
+obj/
+bin/
+
+# Visual Studio
+.vs/
+*.VC.db
+*.suo
+*.user
+
+# Logs
+*.log
+
+# Temporary
+*.tmp
+*.bak
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
