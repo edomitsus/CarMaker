@@ -1,30 +1,85 @@
-# Simulation output
+# Generated simulation output
 SimOutput/
 Movie/
+MovieNX/
 
-# Build output
+# Build artifacts
+bin/
 build/
 Build/
 Debug/
 Release/
 obj/
-bin/
 
 # Visual Studio
 .vs/
 *.VC.db
 *.suo
 *.user
+*.pdb
+
+# CarMaker generated build metadata
+src/.version_*
+src_cm4sl/.version_*
+src/CarMaker.*.exe
+src_cm4sl/CarMaker.*.exe
 
 # Logs
 *.log
 
-# Temporary
+# Temporary files
 *.tmp
 *.bak
+Data/TestRun/.tmp_*
 
-# macOS
+# Local CarMaker preferences
+Data/Config/Preferences.sce
+Data/Config/ADTFConf*
+Data/Config/ChannelAliases
+Data/Config/DataDict
+Data/Config/GPUConfiguration_MultiGPU
+Data/Config/Plugins
+Data/Config/adtf.description
+
+# CarMaker bundled examples and asset catalogs
+Data/*/Examples/
+Data/Driver/Template/
+Data/GUI/ModelClass_Model_TEMPLATE.tcl
+Data/GUI/Templates/
+Data/Traffic/Behavior/
+Data/Traffic/Driver/Car_Generic_*
+Data/Traffic/Driver/Car_HDM_*
+Data/Traffic/Driver/Truck_Generic_*
+Data/Traffic/Driver/Truck_HDM_*
+Data/Traffic/Template/1_Vehicles/
+Data/Traffic/Template/2_People/
+Data/Traffic/Template/3_Animals/
+Data/Traffic/Template/4_StreetFurniture/
+Data/Traffic/Template/5_Buildings/
+Data/VehicleOperator/Template/
+
+# CarMaker bundled default data
+Data/Misc/BattECM_*
+Data/Misc/HydESP*
+Data/Misc/HydIPB_*
+Data/Misc/MySusp*
+Data/Misc/SPMMCfg_*
+Data/OpenSCENARIO/ALKS_Road_Different_Curvatures.xodr
+Data/OpenSCENARIO/Catalogs/
+Data/OpenSCENARIO/test_double_lanechange_trajectory.xosc
+Data/Pic/
+Data/Road/Config/Signals_DEU_*.odrcfg
+Data/Sensor/EphemRinex/rinex_2014/
+Data/Sensor/LidarRSI_Default
+Data/Sensor/MaterialLib
+Data/Sensor/RCS_*
+Data/Sensor/RadarRSI_Default
+Data/Sensor/Radar_Default
+Data/Sensor/USonicRSI_Default
+Data/UserDriver/MyUserDriver
+Data/UserDriver/MyUserDriver_FMU
+Data/UserDriver/UserDriverTemplate
+
+# OS
 .DS_Store
-
-# Windows
 Thumbs.db

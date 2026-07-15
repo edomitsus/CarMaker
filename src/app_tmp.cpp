@@ -3,7 +3,7 @@
  *  CarMaker - Version 15.0
  *  Virtual Test Driving
  *
- *  Copyright Â©1998-2025 IPG Automotive GmbH. All rights reserved.
+ *  Copyright ©1998-2026 IPG Automotive GmbH. All rights reserved.
  *  www.ipg-automotive.com
  *****************************************************************************
  */
@@ -26,33 +26,35 @@
 extern const char *SetConnectedIO (const char *io);
 
 static const char *CompileLibs[] = {
-    /* ../../../fake/win64/lib/../../../src_lib/Portings/win64/lib/libcar.a */
-    /* ../../../fake/win64/lib/../../../src_lib/Portings/win64/lib/libcarmaker.a */
-    /* ../../../fake/win64/lib/../../../lib/IPGDriver/win64/lib/libipgdriver.a */
-    /* ../../../fake/win64/lib/../../../lib/IPGRoad/win64/lib/libipgroad.a */
-    /* ../../../fake/win64/lib/../../../lib/IPGTire/win64/lib/libipgtire.a */
-    "libcar.a	CarMaker-Car win64 15.0 2025-11-17",
+    /* C:/IPG/carmaker/win64-15.0/lib/libcarmaker.a */
+    /* C:/IPG/carmaker/win64-15.0/lib/libcar.a */
+    /* C:/IPG/carmaker/win64-15.0/lib/libipgdriver.a */
+    /* C:/IPG/carmaker/win64-15.0/lib/libipgroad.a */
+    /* C:/IPG/carmaker/win64-15.0/lib/libipgtire.a */
+    /* C:/IPG/carmaker/win64-15.0/Matlab/R2022b/libmatsupp-win64.a */
     "libcarmaker.a	CarMaker win64 15.0 2025-11-17",
+    "libcar.a	CarMaker-Car win64 15.0 2025-11-17",
     "libipgdriver.a	IPGDriver win64 15.0.0.22 2025-11-12",
     "libipgroad.a	IPGRoad win64 15.0 2025-11-14",
     "libipgtire.a	IPGTire win64 9.1.2 2025-11-14",
+    "libmatsupp-win64.a	MATSUPP win64 15.0 (R2022b) 2025-11-12",
     NULL
 };
 
 
 static const char *CompileFlags[] = {
-    "-m64 -O3 -DNDEBUG -DWIN32 -DWIN64 -DCM_NUMVER=150000",
-    "-DMYMODELS -Wall -D__USE_MINGW_ANSI_STDIO -DUNICODE",
+    "",
+    "Used compiler options are not available for MS Visual Studio builds.",
     NULL
 };
 
 
 tAppStartInfo   AppStartInfo = {
-    "CarMaker 15.0 - Car_Generic",          /* App_Version         */
-    "3",          /* App_BuildVersion    */
-    "jetbrains",     /* App_CompileUser     */
-    "02480bbb4087",         /* App_CompileSystem   */
-    "2025-11-17 12:41:57",  /* App_CompileTime */
+    "Car_Generic <insert.your.version.no>",          /* App_Version         */
+    "27",          /* App_BuildVersion    */
+    "edomi",     /* App_CompileUser     */
+    "ponglablaptop",         /* App_CompileSystem   */
+    "2026-07-15 12:50:04",  /* App_CompileTime */
 
     CompileFlags,                /* App_CompileFlags  */
     CompileLibs,                 /* App_Libs          */

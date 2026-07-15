@@ -195,6 +195,7 @@ User_ScanCmdLine(int argc, char **argv)
 int
 User_Init(void)
 {
+    printf("My code is running!\n");
     return 0;
 }
 
@@ -519,6 +520,13 @@ User_VehicleControl_Calc(double dt)
         return 0;
     }
 
+    static bool first = true;
+
+    if (first) {
+        Log("User_VehicleControl_Calc() is running!");
+        first = false;
+    }
+
     return 0;
 }
 
@@ -572,6 +580,12 @@ User_Calc(double dt)
        state. Uncomment the following line in order to restore the behaviour
        of CM 5.1 and earlier. */
     /*if (!UserCalcCalledByAppTestRunCalc) return 0;*/
+
+    static int count = 0;
+
+    if (count++ % 1000 == 0) {
+        Log("Vehicle speed: %f\n", Vehicle.v);
+    }
 
     return 0;
 }
