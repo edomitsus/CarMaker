@@ -75,6 +75,11 @@
 #include <string.h>
 #include <math.h>
 
+#include <array>
+#include <cmath>
+#include <limits>
+#include <random>
+
 #if defined(XENO)
 # include <mio.h>
 #endif
@@ -95,6 +100,187 @@
 int UserCalcCalledByAppTestRunCalc = 0;
 
 tUser User;
+
+namespace {
+
+constexpr double Pi = 3.14159265358979323846;
+constexpr double WeaveAmplitude = 0.75;                  /* desired lateral offset [m] */
+constexpr double WeaveWavelength = 600.0;                /* road distance per cycle [m] */
+constexpr double WaveNumber = 2.0 * Pi / WeaveWavelength;
+
+constexpr double SteeringLimit = 15.0 * Pi / 180.0;      /* steering-wheel angle [rad] */
+constexpr double SteeringRateLimit = 30.0 * Pi / 180.0;  /* [rad/s] */
+constexpr double SteeringAccelerationLimit = 2.0;        /* [rad/s^2] */
+
+constexpr int MppiSamples = 256;
+constexpr int MppiHorizon = 40;
+constexpr double MppiStep = 0.05;                        /* 2.0 s prediction horizon */
+constexpr double MppiUpdatePeriod = 0.05;                /* 20 Hz controller update */
+constexpr double MppiTemperature = 1.0;
+constexpr double MppiNoiseStd = 3.0 * Pi / 180.0;
+constexpr double MppiNoiseCorrelation = 0.70;
+constexpr double MppiWheelbase = 2.8;                    /* bicycle-model wheelbase [m] */
+constexpr double MppiSteeringRatio = 16.0;               /* steering wheel / road wheel */
+
+double
+Clamp(double value, double lower, double upper)
+{
+    return fmax(lower, fmin(upper, value));
+}
+
+double
+WrapAngle(double angle)
+{
+    while (angle > Pi) {
+        angle -= 2.0 * Pi;
+    }
+    while (angle < -Pi) {
+        angle += 2.0 * Pi;
+    }
+    return angle;
+}
+
+double
+ReferenceLateralPosition(double roadDistance)
+{
+    return WeaveAmplitude * sin(WaveNumber * roadDistance);
+}
+
+double
+ReferenceHeading(double roadDistance)
+{
+    const double pathSlope = WeaveAmplitude * WaveNumber * cos(WaveNumber * roadDistance);
+    return atan(pathSlope);
+}
+
+struct MppiResult {
+    double Command;
+    double BestCost;
+    bool Valid;
+};
+
+class SteeringMppi {
+public:
+    SteeringMppi()
+        : RandomGenerator(42u), NormalDistribution(0.0, MppiNoiseStd)
+    {
+        Reset();
+    }
+
+    void Reset()
+    {
+        NominalControl.fill(0.0);
+        Costs.fill(0.0);
+        RandomGenerator.seed(42u);
+        NormalDistribution.reset();
+    }
+
+    MppiResult Update(double roadDistance, double lateralPosition,
+                      double headingRelativeToRoad, double speed,
+                      double previousAppliedSteering)
+    {
+        double minimumCost = std::numeric_limits<double>::infinity();
+        const double correlationScale = sqrt(1.0 - MppiNoiseCorrelation * MppiNoiseCorrelation);
+        const double noiseVariance = MppiNoiseStd * MppiNoiseStd;
+
+        for (int sample = 0; sample < MppiSamples; ++sample) {
+            double predictedDistance = roadDistance;
+            double predictedLateralPosition = lateralPosition;
+            double predictedHeading = headingRelativeToRoad;
+            double previousControl = previousAppliedSteering;
+            double previousNoise = 0.0;
+            double cost = 0.0;
+
+            for (int step = 0; step < MppiHorizon; ++step) {
+                double noise = 0.0;
+                if (sample != 0) {
+                    const double whiteNoise = NormalDistribution(RandomGenerator);
+                    noise = MppiNoiseCorrelation * previousNoise + correlationScale * whiteNoise;
+                }
+
+                const double steering = Clamp(NominalControl[step] + noise,
+                                              -SteeringLimit, SteeringLimit);
+                noise = steering - NominalControl[step];
+                Noise[sample][step] = noise;
+                previousNoise = noise;
+
+                const double frontWheelAngle = steering / MppiSteeringRatio;
+                predictedDistance += speed * cos(predictedHeading) * MppiStep;
+                predictedLateralPosition += speed * sin(predictedHeading) * MppiStep;
+                predictedHeading = WrapAngle(predictedHeading
+                    + speed / MppiWheelbase * tan(frontWheelAngle) * MppiStep);
+
+                const double lateralError =
+                    ReferenceLateralPosition(predictedDistance) - predictedLateralPosition;
+                const double headingError = WrapAngle(
+                    ReferenceHeading(predictedDistance) - predictedHeading);
+                const double controlChange = steering - previousControl;
+
+                const double runningCost =
+                    12.0 * lateralError * lateralError
+                    + 80.0 * headingError * headingError
+                    + 0.2 * steering * steering
+                    + 0.5 * controlChange * controlChange;
+                const double explorationCost = MppiTemperature
+                    * NominalControl[step] * noise / noiseVariance;
+                cost += MppiStep * (runningCost + explorationCost);
+                previousControl = steering;
+            }
+
+            const double terminalLateralError =
+                ReferenceLateralPosition(predictedDistance) - predictedLateralPosition;
+            const double terminalHeadingError = WrapAngle(
+                ReferenceHeading(predictedDistance) - predictedHeading);
+            cost += 30.0 * terminalLateralError * terminalLateralError
+                + 120.0 * terminalHeadingError * terminalHeadingError;
+
+            Costs[sample] = cost;
+            minimumCost = fmin(minimumCost, cost);
+        }
+
+        double weightSum = 0.0;
+        Weights.fill(0.0);
+        for (int sample = 0; sample < MppiSamples; ++sample) {
+            const double scaledCost = (Costs[sample] - minimumCost) / MppiTemperature;
+            if (scaledCost < 60.0) {
+                Weights[sample] = exp(-scaledCost);
+                weightSum += Weights[sample];
+            }
+        }
+
+        if (!std::isfinite(weightSum) || weightSum <= 1.0e-12) {
+            return {0.0, minimumCost, false};
+        }
+
+        for (int step = 0; step < MppiHorizon; ++step) {
+            double weightedNoise = 0.0;
+            for (int sample = 0; sample < MppiSamples; ++sample) {
+                weightedNoise += Weights[sample] * Noise[sample][step];
+            }
+            NominalControl[step] = Clamp(
+                NominalControl[step] + weightedNoise / weightSum,
+                -SteeringLimit, SteeringLimit);
+        }
+
+        const double command = NominalControl[0];
+        for (int step = 0; step < MppiHorizon - 1; ++step) {
+            NominalControl[step] = NominalControl[step + 1];
+        }
+        NominalControl[MppiHorizon - 1] = NominalControl[MppiHorizon - 2];
+
+        return {command, minimumCost, std::isfinite(command)};
+    }
+
+private:
+    std::array<double, MppiHorizon> NominalControl;
+    std::array<std::array<double, MppiHorizon>, MppiSamples> Noise;
+    std::array<double, MppiSamples> Costs;
+    std::array<double, MppiSamples> Weights;
+    std::mt19937 RandomGenerator;
+    std::normal_distribution<double> NormalDistribution;
+};
+
+} /* namespace */
 
 
 /*
@@ -492,10 +678,21 @@ User_In(unsigned const CycleNo)
 int
 User_DrivMan_Calc(double dt)
 {
+    // test to see if this function is called
+    static bool firstDrivMan = true;
+    if (firstDrivMan) {
+        Log("User_DrivMan_Calc() is running!\n");
+        firstDrivMan = false;
+    }
+    static SteeringMppi mppiController;
     static double weaveStartRoadPosition = 0.0;
     static bool weaveReferenceInitialized = false;
     static double steeringCommand = 0.0;
     static double previousSteeringVelocity = 0.0;
+    static double mppiUpdateTimer = 0.0;
+    static double mppiRequestedSteering = 0.0;
+    static double mppiBestCost = 0.0;
+    static bool mppiValid = false;
     static unsigned int logCounter = 0;
 
     /* Rely on the Vehicle Operator within DrivMan module to get
@@ -506,24 +703,25 @@ User_DrivMan_Calc(double dt)
         weaveReferenceInitialized = false;
         steeringCommand = 0.0;
         previousSteeringVelocity = 0.0;
+        mppiUpdateTimer = 0.0;
+        mppiRequestedSteering = 0.0;
+        mppiBestCost = 0.0;
+        mppiValid = false;
+        mppiController.Reset();
         logCounter = 0;
         User.Out[0] = 0.0;
         User.Out[1] = Vehicle.Road.Path.tRoad;
         User.Out[2] = -Vehicle.Road.Path.tRoad;
         User.Out[3] = 0.0;
         User.Out[4] = 0.0;
+        User.Out[5] = 0.0;
+        User.Out[6] = 0.0;
+        User.Out[7] = 0.0;
         return 0;
     }
 
-    constexpr double Pi = 3.14159265358979323846;
-    constexpr double WeaveAmplitude = 0.75;                   /* desired lateral offset [m] */
-    constexpr double WeaveWavelength = 200.0;                 /* road distance per cycle [m] */
-    constexpr double LateralGain = 0.12;                      /* steering-wheel rad / m */
-    constexpr double HeadingGain = 1.5;                       /* steering-wheel rad / rad */
-    constexpr double SteeringLimit = 15.0 * Pi / 180.0;       /* [rad] */
-    constexpr double SteeringRateLimit = 30.0 * Pi / 180.0;   /* [rad/s] */
-    constexpr double SteeringAccelerationLimit = 2.0;         /* [rad/s^2] */
-    constexpr double WaveNumber = 2.0 * Pi / WeaveWavelength; /* [rad/m] */
+    constexpr double FallbackLateralGain = 0.12;
+    constexpr double FallbackHeadingGain = 1.5;
 
     if (dt <= 0.0 || Vehicle.Road.offRoute) {
         return 0;
@@ -533,34 +731,45 @@ User_DrivMan_Calc(double dt)
     if (!weaveReferenceInitialized && vehicleSpeed > 1.0) {
         weaveStartRoadPosition = Vehicle.sRoad;
         weaveReferenceInitialized = true;
+        mppiUpdateTimer = MppiUpdatePeriod;
+        mppiController.Reset();
     }
 
     const double weaveDistance =
         weaveReferenceInitialized ? Vehicle.sRoad - weaveStartRoadPosition : 0.0;
-    const double desiredLateralPosition =
-        WeaveAmplitude * sin(WaveNumber * weaveDistance);
-    const double desiredPathSlope = weaveReferenceInitialized
-        ? WeaveAmplitude * WaveNumber * cos(WaveNumber * weaveDistance)
-        : 0.0;
+    const double desiredLateralPosition = ReferenceLateralPosition(weaveDistance);
+    const double desiredHeadingRelativeToRoad = weaveReferenceInitialized
+        ? ReferenceHeading(weaveDistance) : 0.0;
     const double roadHeading = atan2(Vehicle.Road.Path.X_0[1], Vehicle.Road.Path.X_0[0]);
-    const double desiredHeading = roadHeading + atan(desiredPathSlope);
-
-    double headingError = desiredHeading - Vehicle.Yaw;
-    while (headingError > Pi) {
-        headingError -= 2.0 * Pi;
-    }
-    while (headingError < -Pi) {
-        headingError += 2.0 * Pi;
-    }
+    const double headingRelativeToRoad = WrapAngle(Vehicle.Yaw - roadHeading);
+    const double headingError = WrapAngle(
+        desiredHeadingRelativeToRoad - headingRelativeToRoad);
 
     const double lateralError = desiredLateralPosition - Vehicle.Road.Path.tRoad;
-    double desiredSteering = LateralGain * lateralError + HeadingGain * headingError;
-    desiredSteering = fmax(-SteeringLimit, fmin(SteeringLimit, desiredSteering));
+    const double fallbackSteering = Clamp(
+        FallbackLateralGain * lateralError + FallbackHeadingGain * headingError,
+        -SteeringLimit, SteeringLimit);
+
+    if (weaveReferenceInitialized && vehicleSpeed > 1.0) {
+        mppiUpdateTimer += dt;
+        if (mppiUpdateTimer >= MppiUpdatePeriod) {
+            const MppiResult result = mppiController.Update(
+                weaveDistance, Vehicle.Road.Path.tRoad,
+                headingRelativeToRoad, vehicleSpeed, steeringCommand);
+            mppiUpdateTimer = fmod(mppiUpdateTimer, MppiUpdatePeriod);
+            mppiBestCost = result.BestCost;
+            mppiValid = result.Valid;
+            mppiRequestedSteering = result.Valid ? result.Command : fallbackSteering;
+        }
+    } else {
+        mppiValid = false;
+        mppiRequestedSteering = fallbackSteering;
+    }
 
     const double previousSteeringCommand = steeringCommand;
     const double maximumSteeringStep = SteeringRateLimit * dt;
-    const double steeringError = desiredSteering - steeringCommand;
-    steeringCommand += fmax(-maximumSteeringStep, fmin(maximumSteeringStep, steeringError));
+    const double steeringError = mppiRequestedSteering - steeringCommand;
+    steeringCommand += Clamp(steeringError, -maximumSteeringStep, maximumSteeringStep);
 
     const double steeringVelocity = (steeringCommand - previousSteeringCommand) / dt;
     double steeringAcceleration = (steeringVelocity - previousSteeringVelocity) / dt;
@@ -578,10 +787,15 @@ User_DrivMan_Calc(double dt)
     User.Out[2] = lateralError;
     User.Out[3] = headingError;
     User.Out[4] = steeringCommand;
+    User.Out[5] = mppiRequestedSteering;
+    User.Out[6] = mppiBestCost;
+    User.Out[7] = mppiValid ? 1.0 : 0.0;
 
     if (logCounter++ % 1000 == 0) {
-        Log("Steering control: target=%.3f m actual=%.3f m command=%.2f deg\n",
-            desiredLateralPosition, Vehicle.Road.Path.tRoad, steeringCommand * 180.0 / Pi);
+        Log("MPPI steering: target=%.3f m actual=%.3f m command=%.2f deg cost=%.2f mode=%s\n",
+            desiredLateralPosition, Vehicle.Road.Path.tRoad,
+            steeringCommand * 180.0 / Pi, mppiBestCost,
+            mppiValid ? "MPPI" : "fallback");
     }
 
     return 0;
@@ -608,6 +822,7 @@ User_VehicleControl_Calc(double dt)
     static bool first = true;
 
     if (first) {
+        Log("BUILD STAMP: MPPI_TEST_2026_07_15_1618\n");
         Log("User_VehicleControl_Calc() is running!");
         first = false;
     }
