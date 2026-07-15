@@ -492,12 +492,27 @@ User_In(unsigned const CycleNo)
 int
 User_DrivMan_Calc(double dt)
 {
+    static double steeringTime = 0.0;
+
     /* Rely on the Vehicle Operator within DrivMan module to get
        the vehicle in driving state using the IPG's
        PowerTrain Control model 'Generic' or similar */
     if (Vehicle.OperationState != OperState_Driving) {
+        steeringTime = 0.0;
         return 0;
     }
+
+    constexpr double Pi = 3.14159265358979323846;
+    constexpr double SteeringAmplitude = 10.0 * Pi / 180.0; /* steering-wheel angle [rad] */
+    constexpr double SteeringFrequency = 0.1;               /* [Hz] */
+    constexpr double Omega = 2.0 * Pi * SteeringFrequency;
+
+    steeringTime += dt;
+
+    DrivMan.Steering.SteerBy = DMSteerBy_Angle;
+    DrivMan.Steering.Ang = SteeringAmplitude * sin(Omega * steeringTime);
+    DrivMan.Steering.AngVel = SteeringAmplitude * Omega * cos(Omega * steeringTime);
+    DrivMan.Steering.AngAcc = -SteeringAmplitude * Omega * Omega * sin(Omega * steeringTime);
 
     return 0;
 }
