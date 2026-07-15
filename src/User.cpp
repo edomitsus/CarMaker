@@ -104,20 +104,26 @@ tUser User;
 namespace {
 
 constexpr double Pi = 3.14159265358979323846;
-constexpr double WeaveAmplitude = 0.75;                  /* desired lateral offset [m] */
-constexpr double WeaveWavelength = 600.0;                /* road distance per cycle [m] */
-constexpr double WaveNumber = 2.0 * Pi / WeaveWavelength;
+
+/* Fake obstacle in road coordinates, measured from controller activation. */
+constexpr double ObstacleRoadDistance = 300.0;            /* [m] */
+constexpr double ObstacleLateralPosition = 0.0;           /* road center [m] */
+constexpr double ObstacleLongitudinalRadius = 25.0;       /* avoidance envelope [m] */
+constexpr double ObstacleLateralRadius = 1.75;            /* avoidance envelope [m] */
+constexpr double PreferredPassingLateralPosition = 2.25;  /* deterministic left pass [m] */
+constexpr double RoadSoftLateralLimit = 3.0;              /* assumed usable half-width [m] */
+constexpr double RoadHardLateralLimit = 4.0;              /* strong edge penalty [m] */
 
 constexpr double SteeringLimit = 15.0 * Pi / 180.0;      /* steering-wheel angle [rad] */
 constexpr double SteeringRateLimit = 30.0 * Pi / 180.0;  /* [rad/s] */
 constexpr double SteeringAccelerationLimit = 2.0;        /* [rad/s^2] */
 
 constexpr int MppiSamples = 256;
-constexpr int MppiHorizon = 40;
-constexpr double MppiStep = 0.05;                        /* 2.0 s prediction horizon */
+constexpr int MppiHorizon = 60;
+constexpr double MppiStep = 0.05;                        /* 3.0 s prediction horizon */
 constexpr double MppiUpdatePeriod = 0.05;                /* 20 Hz controller update */
-constexpr double MppiTemperature = 1.0;
-constexpr double MppiNoiseStd = 3.0 * Pi / 180.0;
+constexpr double MppiTemperature = 5.0;
+constexpr double MppiNoiseStd = 4.0 * Pi / 180.0;
 constexpr double MppiNoiseCorrelation = 0.70;
 constexpr double MppiWheelbase = 2.8;                    /* bicycle-model wheelbase [m] */
 constexpr double MppiSteeringRatio = 16.0;               /* steering wheel / road wheel */
@@ -141,16 +147,41 @@ WrapAngle(double angle)
 }
 
 double
-ReferenceLateralPosition(double roadDistance)
+ObstacleCost(double roadDistance, double lateralPosition)
 {
-    return WeaveAmplitude * sin(WaveNumber * roadDistance);
+    const double longitudinalSeparation =
+        (roadDistance - ObstacleRoadDistance) / ObstacleLongitudinalRadius;
+    const double lateralSeparation =
+        (lateralPosition - ObstacleLateralPosition) / ObstacleLateralRadius;
+    const double normalizedDistanceSquared =
+        longitudinalSeparation * longitudinalSeparation
+        + lateralSeparation * lateralSeparation;
+
+    double cost = 250.0 * exp(-0.5 * normalizedDistanceSquared);
+    const double passingGate = exp(-0.5 * longitudinalSeparation * longitudinalSeparation);
+    const double passingError = lateralPosition - PreferredPassingLateralPosition;
+    cost += 3.0 * passingGate * passingError * passingError;
+    if (normalizedDistanceSquared < 1.0) {
+        const double penetration = 1.0 - normalizedDistanceSquared;
+        cost += 2000.0 + 8000.0 * penetration * penetration;
+    }
+    return cost;
 }
 
 double
-ReferenceHeading(double roadDistance)
+RoadBoundaryCost(double lateralPosition)
 {
-    const double pathSlope = WeaveAmplitude * WaveNumber * cos(WaveNumber * roadDistance);
-    return atan(pathSlope);
+    const double absoluteLateralPosition = fabs(lateralPosition);
+    double cost = 0.0;
+    if (absoluteLateralPosition > RoadSoftLateralLimit) {
+        const double excess = absoluteLateralPosition - RoadSoftLateralLimit;
+        cost += 500.0 * excess * excess;
+    }
+    if (absoluteLateralPosition > RoadHardLateralLimit) {
+        const double excess = absoluteLateralPosition - RoadHardLateralLimit;
+        cost += 5000.0 * (1.0 + excess * excess);
+    }
+    return cost;
 }
 
 struct MppiResult {
@@ -210,29 +241,29 @@ public:
                 predictedHeading = WrapAngle(predictedHeading
                     + speed / MppiWheelbase * tan(frontWheelAngle) * MppiStep);
 
-                const double lateralError =
-                    ReferenceLateralPosition(predictedDistance) - predictedLateralPosition;
-                const double headingError = WrapAngle(
-                    ReferenceHeading(predictedDistance) - predictedHeading);
+                const double lateralError = -predictedLateralPosition;
+                const double headingError = WrapAngle(-predictedHeading);
                 const double controlChange = steering - previousControl;
 
                 const double runningCost =
-                    12.0 * lateralError * lateralError
-                    + 80.0 * headingError * headingError
+                    4.0 * lateralError * lateralError
+                    + 60.0 * headingError * headingError
                     + 0.2 * steering * steering
-                    + 0.5 * controlChange * controlChange;
+                    + 0.5 * controlChange * controlChange
+                    + ObstacleCost(predictedDistance, predictedLateralPosition)
+                    + RoadBoundaryCost(predictedLateralPosition);
                 const double explorationCost = MppiTemperature
                     * NominalControl[step] * noise / noiseVariance;
                 cost += MppiStep * (runningCost + explorationCost);
                 previousControl = steering;
             }
 
-            const double terminalLateralError =
-                ReferenceLateralPosition(predictedDistance) - predictedLateralPosition;
-            const double terminalHeadingError = WrapAngle(
-                ReferenceHeading(predictedDistance) - predictedHeading);
-            cost += 30.0 * terminalLateralError * terminalLateralError
-                + 120.0 * terminalHeadingError * terminalHeadingError;
+            const double terminalLateralError = -predictedLateralPosition;
+            const double terminalHeadingError = WrapAngle(-predictedHeading);
+            cost += 12.0 * terminalLateralError * terminalLateralError
+                + 100.0 * terminalHeadingError * terminalHeadingError
+                + ObstacleCost(predictedDistance, predictedLateralPosition)
+                + RoadBoundaryCost(predictedLateralPosition);
 
             Costs[sample] = cost;
             minimumCost = fmin(minimumCost, cost);
@@ -685,8 +716,8 @@ User_DrivMan_Calc(double dt)
         firstDrivMan = false;
     }
     static SteeringMppi mppiController;
-    static double weaveStartRoadPosition = 0.0;
-    static bool weaveReferenceInitialized = false;
+    static double controlStartRoadPosition = 0.0;
+    static bool controlReferenceInitialized = false;
     static double steeringCommand = 0.0;
     static double previousSteeringVelocity = 0.0;
     static double mppiUpdateTimer = 0.0;
@@ -699,8 +730,8 @@ User_DrivMan_Calc(double dt)
        the vehicle in driving state using the IPG's
        PowerTrain Control model 'Generic' or similar */
     if (Vehicle.OperationState != OperState_Driving) {
-        weaveStartRoadPosition = 0.0;
-        weaveReferenceInitialized = false;
+        controlStartRoadPosition = 0.0;
+        controlReferenceInitialized = false;
         steeringCommand = 0.0;
         previousSteeringVelocity = 0.0;
         mppiUpdateTimer = 0.0;
@@ -717,6 +748,8 @@ User_DrivMan_Calc(double dt)
         User.Out[5] = 0.0;
         User.Out[6] = 0.0;
         User.Out[7] = 0.0;
+        User.Out[8] = ObstacleRoadDistance;
+        User.Out[9] = 0.0;
         return 0;
     }
 
@@ -728,18 +761,17 @@ User_DrivMan_Calc(double dt)
     }
 
     const double vehicleSpeed = fabs(Vehicle.v);
-    if (!weaveReferenceInitialized && vehicleSpeed > 1.0) {
-        weaveStartRoadPosition = Vehicle.sRoad;
-        weaveReferenceInitialized = true;
+    if (!controlReferenceInitialized && vehicleSpeed > 1.0) {
+        controlStartRoadPosition = Vehicle.sRoad;
+        controlReferenceInitialized = true;
         mppiUpdateTimer = MppiUpdatePeriod;
         mppiController.Reset();
     }
 
-    const double weaveDistance =
-        weaveReferenceInitialized ? Vehicle.sRoad - weaveStartRoadPosition : 0.0;
-    const double desiredLateralPosition = ReferenceLateralPosition(weaveDistance);
-    const double desiredHeadingRelativeToRoad = weaveReferenceInitialized
-        ? ReferenceHeading(weaveDistance) : 0.0;
+    const double distanceFromControlStart = controlReferenceInitialized
+        ? Vehicle.sRoad - controlStartRoadPosition : 0.0;
+    constexpr double desiredLateralPosition = 0.0;
+    constexpr double desiredHeadingRelativeToRoad = 0.0;
     const double roadHeading = atan2(Vehicle.Road.Path.X_0[1], Vehicle.Road.Path.X_0[0]);
     const double headingRelativeToRoad = WrapAngle(Vehicle.Yaw - roadHeading);
     const double headingError = WrapAngle(
@@ -750,11 +782,11 @@ User_DrivMan_Calc(double dt)
         FallbackLateralGain * lateralError + FallbackHeadingGain * headingError,
         -SteeringLimit, SteeringLimit);
 
-    if (weaveReferenceInitialized && vehicleSpeed > 1.0) {
+    if (controlReferenceInitialized && vehicleSpeed > 1.0) {
         mppiUpdateTimer += dt;
         if (mppiUpdateTimer >= MppiUpdatePeriod) {
             const MppiResult result = mppiController.Update(
-                weaveDistance, Vehicle.Road.Path.tRoad,
+                distanceFromControlStart, Vehicle.Road.Path.tRoad,
                 headingRelativeToRoad, vehicleSpeed, steeringCommand);
             mppiUpdateTimer = fmod(mppiUpdateTimer, MppiUpdatePeriod);
             mppiBestCost = result.BestCost;
@@ -790,10 +822,12 @@ User_DrivMan_Calc(double dt)
     User.Out[5] = mppiRequestedSteering;
     User.Out[6] = mppiBestCost;
     User.Out[7] = mppiValid ? 1.0 : 0.0;
+    User.Out[8] = ObstacleRoadDistance - distanceFromControlStart;
+    User.Out[9] = ObstacleCost(distanceFromControlStart, Vehicle.Road.Path.tRoad);
 
     if (logCounter++ % 1000 == 0) {
-        Log("MPPI steering: target=%.3f m actual=%.3f m command=%.2f deg cost=%.2f mode=%s\n",
-            desiredLateralPosition, Vehicle.Road.Path.tRoad,
+        Log("MPPI obstacle: ahead=%.1f m lateral=%.3f m command=%.2f deg cost=%.2f mode=%s\n",
+            ObstacleRoadDistance - distanceFromControlStart, Vehicle.Road.Path.tRoad,
             steeringCommand * 180.0 / Pi, mppiBestCost,
             mppiValid ? "MPPI" : "fallback");
     }
