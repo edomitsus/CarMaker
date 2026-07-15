@@ -492,27 +492,81 @@ User_In(unsigned const CycleNo)
 int
 User_DrivMan_Calc(double dt)
 {
-    static double steeringTime = 0.0;
+    static double controlTime = 0.0;
+    static double steeringCommand = 0.0;
+    static double previousSteeringVelocity = 0.0;
+    static unsigned int logCounter = 0;
 
     /* Rely on the Vehicle Operator within DrivMan module to get
        the vehicle in driving state using the IPG's
        PowerTrain Control model 'Generic' or similar */
     if (Vehicle.OperationState != OperState_Driving) {
-        steeringTime = 0.0;
+        controlTime = 0.0;
+        steeringCommand = 0.0;
+        previousSteeringVelocity = 0.0;
+        logCounter = 0;
         return 0;
     }
 
     constexpr double Pi = 3.14159265358979323846;
-    constexpr double SteeringAmplitude = 10.0 * Pi / 180.0; /* steering-wheel angle [rad] */
-    constexpr double SteeringFrequency = 0.1;               /* [Hz] */
-    constexpr double Omega = 2.0 * Pi * SteeringFrequency;
+    constexpr double WeaveAmplitude = 0.75;                   /* desired lateral offset [m] */
+    constexpr double WeaveFrequency = 0.05;                   /* [Hz] */
+    constexpr double LateralGain = 0.12;                      /* steering-wheel rad / m */
+    constexpr double HeadingGain = 1.5;                       /* steering-wheel rad / rad */
+    constexpr double SteeringLimit = 15.0 * Pi / 180.0;       /* [rad] */
+    constexpr double SteeringRateLimit = 30.0 * Pi / 180.0;   /* [rad/s] */
+    constexpr double SteeringAccelerationLimit = 2.0;         /* [rad/s^2] */
+    constexpr double Omega = 2.0 * Pi * WeaveFrequency;
 
-    steeringTime += dt;
+    if (dt <= 0.0 || Vehicle.Road.offRoute) {
+        return 0;
+    }
+
+    const double vehicleSpeed = fabs(Vehicle.v);
+    const bool weaveActive = vehicleSpeed > 1.0;
+    if (weaveActive) {
+        controlTime += dt;
+    }
+
+    const double desiredLateralPosition = WeaveAmplitude * sin(Omega * controlTime);
+    const double desiredLateralVelocity =
+        weaveActive ? WeaveAmplitude * Omega * cos(Omega * controlTime) : 0.0;
+    const double roadHeading = atan2(Vehicle.Road.Path.X_0[1], Vehicle.Road.Path.X_0[0]);
+    const double forwardSpeed = fmax(vehicleSpeed, 5.0);
+    const double desiredHeading = roadHeading + atan2(desiredLateralVelocity, forwardSpeed);
+
+    double headingError = desiredHeading - Vehicle.Yaw;
+    while (headingError > Pi) {
+        headingError -= 2.0 * Pi;
+    }
+    while (headingError < -Pi) {
+        headingError += 2.0 * Pi;
+    }
+
+    const double lateralError = desiredLateralPosition - Vehicle.Road.Path.tRoad;
+    double desiredSteering = LateralGain * lateralError + HeadingGain * headingError;
+    desiredSteering = fmax(-SteeringLimit, fmin(SteeringLimit, desiredSteering));
+
+    const double previousSteeringCommand = steeringCommand;
+    const double maximumSteeringStep = SteeringRateLimit * dt;
+    const double steeringError = desiredSteering - steeringCommand;
+    steeringCommand += fmax(-maximumSteeringStep, fmin(maximumSteeringStep, steeringError));
+
+    const double steeringVelocity = (steeringCommand - previousSteeringCommand) / dt;
+    double steeringAcceleration = (steeringVelocity - previousSteeringVelocity) / dt;
+    steeringAcceleration = fmax(-SteeringAccelerationLimit,
+                                fmin(SteeringAccelerationLimit, steeringAcceleration));
+    previousSteeringVelocity = steeringVelocity;
 
     DrivMan.Steering.SteerBy = DMSteerBy_Angle;
-    DrivMan.Steering.Ang = SteeringAmplitude * sin(Omega * steeringTime);
-    DrivMan.Steering.AngVel = SteeringAmplitude * Omega * cos(Omega * steeringTime);
-    DrivMan.Steering.AngAcc = -SteeringAmplitude * Omega * Omega * sin(Omega * steeringTime);
+    DrivMan.Steering.Ang = steeringCommand;
+    DrivMan.Steering.AngVel = steeringVelocity;
+    DrivMan.Steering.AngAcc = steeringAcceleration;
+
+    if (logCounter++ % 1000 == 0) {
+        Log("Steering control: target=%.3f m actual=%.3f m command=%.2f deg",
+            desiredLateralPosition, Vehicle.Road.Path.tRoad, steeringCommand * 180.0 / Pi);
+    }
 
     return 0;
 }
