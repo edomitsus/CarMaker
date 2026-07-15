@@ -492,7 +492,8 @@ User_In(unsigned const CycleNo)
 int
 User_DrivMan_Calc(double dt)
 {
-    static double controlTime = 0.0;
+    static double weaveStartRoadPosition = 0.0;
+    static bool weaveReferenceInitialized = false;
     static double steeringCommand = 0.0;
     static double previousSteeringVelocity = 0.0;
     static unsigned int logCounter = 0;
@@ -501,39 +502,48 @@ User_DrivMan_Calc(double dt)
        the vehicle in driving state using the IPG's
        PowerTrain Control model 'Generic' or similar */
     if (Vehicle.OperationState != OperState_Driving) {
-        controlTime = 0.0;
+        weaveStartRoadPosition = 0.0;
+        weaveReferenceInitialized = false;
         steeringCommand = 0.0;
         previousSteeringVelocity = 0.0;
         logCounter = 0;
+        User.Out[0] = 0.0;
+        User.Out[1] = Vehicle.Road.Path.tRoad;
+        User.Out[2] = -Vehicle.Road.Path.tRoad;
+        User.Out[3] = 0.0;
+        User.Out[4] = 0.0;
         return 0;
     }
 
     constexpr double Pi = 3.14159265358979323846;
     constexpr double WeaveAmplitude = 0.75;                   /* desired lateral offset [m] */
-    constexpr double WeaveFrequency = 0.05;                   /* [Hz] */
+    constexpr double WeaveWavelength = 200.0;                 /* road distance per cycle [m] */
     constexpr double LateralGain = 0.12;                      /* steering-wheel rad / m */
     constexpr double HeadingGain = 1.5;                       /* steering-wheel rad / rad */
     constexpr double SteeringLimit = 15.0 * Pi / 180.0;       /* [rad] */
     constexpr double SteeringRateLimit = 30.0 * Pi / 180.0;   /* [rad/s] */
     constexpr double SteeringAccelerationLimit = 2.0;         /* [rad/s^2] */
-    constexpr double Omega = 2.0 * Pi * WeaveFrequency;
+    constexpr double WaveNumber = 2.0 * Pi / WeaveWavelength; /* [rad/m] */
 
     if (dt <= 0.0 || Vehicle.Road.offRoute) {
         return 0;
     }
 
     const double vehicleSpeed = fabs(Vehicle.v);
-    const bool weaveActive = vehicleSpeed > 1.0;
-    if (weaveActive) {
-        controlTime += dt;
+    if (!weaveReferenceInitialized && vehicleSpeed > 1.0) {
+        weaveStartRoadPosition = Vehicle.sRoad;
+        weaveReferenceInitialized = true;
     }
 
-    const double desiredLateralPosition = WeaveAmplitude * sin(Omega * controlTime);
-    const double desiredLateralVelocity =
-        weaveActive ? WeaveAmplitude * Omega * cos(Omega * controlTime) : 0.0;
+    const double weaveDistance =
+        weaveReferenceInitialized ? Vehicle.sRoad - weaveStartRoadPosition : 0.0;
+    const double desiredLateralPosition =
+        WeaveAmplitude * sin(WaveNumber * weaveDistance);
+    const double desiredPathSlope = weaveReferenceInitialized
+        ? WeaveAmplitude * WaveNumber * cos(WaveNumber * weaveDistance)
+        : 0.0;
     const double roadHeading = atan2(Vehicle.Road.Path.X_0[1], Vehicle.Road.Path.X_0[0]);
-    const double forwardSpeed = fmax(vehicleSpeed, 5.0);
-    const double desiredHeading = roadHeading + atan2(desiredLateralVelocity, forwardSpeed);
+    const double desiredHeading = roadHeading + atan(desiredPathSlope);
 
     double headingError = desiredHeading - Vehicle.Yaw;
     while (headingError > Pi) {
@@ -563,8 +573,14 @@ User_DrivMan_Calc(double dt)
     DrivMan.Steering.AngVel = steeringVelocity;
     DrivMan.Steering.AngAcc = steeringAcceleration;
 
+    User.Out[0] = desiredLateralPosition;
+    User.Out[1] = Vehicle.Road.Path.tRoad;
+    User.Out[2] = lateralError;
+    User.Out[3] = headingError;
+    User.Out[4] = steeringCommand;
+
     if (logCounter++ % 1000 == 0) {
-        Log("Steering control: target=%.3f m actual=%.3f m command=%.2f deg",
+        Log("Steering control: target=%.3f m actual=%.3f m command=%.2f deg\n",
             desiredLateralPosition, Vehicle.Road.Path.tRoad, steeringCommand * 180.0 / Pi);
     }
 
