@@ -242,9 +242,11 @@ Mounted Object Sensor
 
 VehSensor_0 / OB00
 
-The nearest detected object supplies dx and dy.
+Up to eight detected objects ahead supply dx and dy.
 
-Obstacle cost is active only when dtct == 1 and dx > 0.
+Detected objects are stored nearest-first when dtct == 1 and dx > 0.
+
+MPPI applies the existing obstacle penalty to every valid object in the list.
 
 No hard-coded obstacle position remains.
 
@@ -296,11 +298,15 @@ Reserved
 
 Obstacle longitudinal distance
 
+Nearest obstacle dx, or 999 when none are detected
+
 User.Out[9]
 
 Reserved
 
 Obstacle lateral distance
+
+Nearest obstacle dy, or 0 when none are detected
 
 ---
 
@@ -341,6 +347,8 @@ STARTUP = vehicle has not yet exceeded 1 m/s
 MOVING = vehicle has exceeded 1 m/s and is currently at or above 1 m/s
 
 STALLED = vehicle previously exceeded 1 m/s and is currently below 1 m/s
+
+Obstacle logging includes obstacleCount, nearest dx/dy/id, and the concise list of object IDs.
 
 ---
 
@@ -424,7 +432,7 @@ Object Sensor OB00
 
 ↓
 
-Nearest detected object
+Up to eight nearest detected objects ahead
 
 ↓
 
@@ -460,7 +468,7 @@ Read observed objects.
 
 3.
 
-Choose nearest object ahead.
+Collect detected objects ahead, sort nearest-first, and limit the list to eight.
 
 4.
 
@@ -474,7 +482,7 @@ to obstacle position.
 
 5.
 
-Use the detected object as the MPPI obstacle.
+Use every valid detected object in the MPPI obstacle-cost loop.
 
 ---
 
@@ -601,8 +609,15 @@ The controller
 - evaluates trajectory cost,
 - updates the nominal steering sequence,
 - uses the mounted Object Sensor as its only obstacle source,
+- evaluates up to eight detected obstacles per rollout state,
 - returns toward lane center.
 
 The sensor obstacle cost is disabled when no forward object is detected.
 
 Low speed after prior movement enters RECOVERY mode rather than permanently switching to fallback steering.
+
+2026-07-16
+- Sensor-based MPPI obstacle avoidance succeeded.
+- Object Sensor VehSensor_0 detected traffic vehicle.
+- MPPI avoided obstacle and returned to lane.
+- Disabled IPGDriver “Consider traffic” so longitudinal control does not stop behind obstacle.

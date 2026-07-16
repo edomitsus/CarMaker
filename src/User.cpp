@@ -113,12 +113,31 @@ constexpr double PreferredPassingLateralPosition = 2.25;  /* deterministic left 
 constexpr double RoadSoftLateralLimit = 3.0;              /* assumed usable half-width [m] */
 constexpr double RoadHardLateralLimit = 4.0;              /* strong edge penalty [m] */
 
-bool SensorObstacleDetected = false;
-double SensorObstacleDx = 0.0;
-double SensorObstacleDy = 0.0;
-bool SensorObstacleActive = false;
-double SensorObstacleRoadDistance = 0.0;
-double SensorObstacleLateralPosition = 0.0;
+struct Obstacle {
+    bool valid;
+    double dx;
+    double dy;
+    double radius;
+    int objId;
+};
+
+constexpr int MaxObstacles = 8;
+std::array<Obstacle, MaxObstacles> SensorObstacles{};
+int SensorObstacleCount = 0;
+double SensorObstacleReferenceRoadDistance = 0.0;
+double SensorObstacleReferenceLateralPosition = 0.0;
+
+double
+NearestObstacleDx()
+{
+    return SensorObstacleCount > 0 ? SensorObstacles[0].dx : 999.0;
+}
+
+double
+NearestObstacleDy()
+{
+    return SensorObstacleCount > 0 ? SensorObstacles[0].dy : 0.0;
+}
 
 constexpr double SteeringLimit = 15.0 * Pi / 180.0;      /* steering-wheel angle [rad] */
 constexpr double SteeringRateLimit = 30.0 * Pi / 180.0;  /* [rad/s] */
@@ -194,27 +213,38 @@ WrapAngle(double angle)
 double
 ObstacleCost(double roadDistance, double lateralPosition)
 {
-    if (!SensorObstacleActive) {
-        return 0.0;
+    double totalCost = 0.0;
+
+    for (int i = 0; i < SensorObstacleCount; ++i) {
+        const Obstacle &obstacle = SensorObstacles[i];
+        if (!obstacle.valid) {
+            continue;
+        }
+
+        const double obstacleRoadDistance =
+            SensorObstacleReferenceRoadDistance + obstacle.dx;
+        const double obstacleLateralPosition =
+            SensorObstacleReferenceLateralPosition + obstacle.dy;
+        const double longitudinalSeparation =
+            (roadDistance - obstacleRoadDistance) / ObstacleLongitudinalRadius;
+        const double lateralSeparation =
+            (lateralPosition - obstacleLateralPosition) / obstacle.radius;
+        const double normalizedDistanceSquared =
+            longitudinalSeparation * longitudinalSeparation
+            + lateralSeparation * lateralSeparation;
+
+        double cost = 250.0 * exp(-0.5 * normalizedDistanceSquared);
+        const double passingGate = exp(-0.5 * longitudinalSeparation * longitudinalSeparation);
+        const double passingError = lateralPosition - PreferredPassingLateralPosition;
+        cost += 3.0 * passingGate * passingError * passingError;
+        if (normalizedDistanceSquared < 1.0) {
+            const double penetration = 1.0 - normalizedDistanceSquared;
+            cost += 2000.0 + 8000.0 * penetration * penetration;
+        }
+        totalCost += cost;
     }
 
-    const double longitudinalSeparation =
-        (roadDistance - SensorObstacleRoadDistance) / ObstacleLongitudinalRadius;
-    const double lateralSeparation =
-        (lateralPosition - SensorObstacleLateralPosition) / ObstacleLateralRadius;
-    const double normalizedDistanceSquared =
-        longitudinalSeparation * longitudinalSeparation
-        + lateralSeparation * lateralSeparation;
-
-    double cost = 250.0 * exp(-0.5 * normalizedDistanceSquared);
-    const double passingGate = exp(-0.5 * longitudinalSeparation * longitudinalSeparation);
-    const double passingError = lateralPosition - PreferredPassingLateralPosition;
-    cost += 3.0 * passingGate * passingError * passingError;
-    if (normalizedDistanceSquared < 1.0) {
-        const double penetration = 1.0 - normalizedDistanceSquared;
-        cost += 2000.0 + 8000.0 * penetration * penetration;
-    }
-    return cost;
+    return totalCost;
 }
 
 double
@@ -368,17 +398,44 @@ constexpr char ObjectSensorName[] = "VehSensor_0";
 
 int MountedObjectSensorIndex = -1;
 tObjectSensor *MountedObjectSensor = nullptr;
-unsigned int ObjectSensorLogCounter = 0;
-int PreviousDetectedObjectId = -1;
 
 void
-ReadNearestDetectedObject()
+InsertObstacleNearestFirst(std::array<Obstacle, MaxObstacles> &obstacles,
+                           int &obstacleCount, Obstacle const &candidate)
 {
-    int detected = 0;
-    int nearestObjectId = -1;
-    double nearestDistance = std::numeric_limits<double>::infinity();
-    double dx = MountedObjectSensor == nullptr ? 999.0 : 0.0;
-    double dy = 0.0;
+    const double candidateDistanceSquared =
+        candidate.dx * candidate.dx + candidate.dy * candidate.dy;
+    int insertionIndex = 0;
+    while (insertionIndex < obstacleCount) {
+        const Obstacle &existing = obstacles[insertionIndex];
+        const double existingDistanceSquared =
+            existing.dx * existing.dx + existing.dy * existing.dy;
+        if (candidateDistanceSquared < existingDistanceSquared) {
+            break;
+        }
+        ++insertionIndex;
+    }
+
+    if (insertionIndex >= MaxObstacles) {
+        return;
+    }
+
+    const int lastIndex = obstacleCount < MaxObstacles
+        ? obstacleCount : MaxObstacles - 1;
+    for (int i = lastIndex; i > insertionIndex; --i) {
+        obstacles[i] = obstacles[i - 1];
+    }
+    obstacles[insertionIndex] = candidate;
+    if (obstacleCount < MaxObstacles) {
+        ++obstacleCount;
+    }
+}
+
+void
+ReadDetectedObstacles()
+{
+    std::array<Obstacle, MaxObstacles> detectedObstacles{};
+    int detectedObstacleCount = 0;
 
     if (MountedObjectSensor != nullptr) {
         for (int i = 0; i < MountedObjectSensor->nObsvObjects; ++i) {
@@ -386,33 +443,28 @@ ReadNearestDetectedObject()
             tObjectSensorObj *object =
                 ObjectSensor_GetObjectByObjId(MountedObjectSensorIndex, objectId);
 
-            if (object == nullptr || object->dtct == 0
-                || !std::isfinite(object->NearPnt.ds_p)) {
+            if (object == nullptr || object->dtct == 0) {
                 continue;
             }
 
-            if (object->NearPnt.ds_p < nearestDistance) {
-                detected = 1;
-                nearestObjectId = object->ObjId;
-                nearestDistance = object->NearPnt.ds_p;
-                dx = object->NearPnt.ds[0];
-                dy = object->NearPnt.ds[1];
+            const double dx = object->NearPnt.ds[0];
+            const double dy = object->NearPnt.ds[1];
+            if (!std::isfinite(dx) || !std::isfinite(dy) || dx <= 0.0) {
+                continue;
             }
+
+            const Obstacle candidate = {
+                true, dx, dy, ObstacleLateralRadius, object->ObjId
+            };
+            InsertObstacleNearestFirst(
+                detectedObstacles, detectedObstacleCount, candidate);
         }
     }
 
-    User.Out[8] = dx;
-    User.Out[9] = dy;
-    SensorObstacleDetected = detected != 0;
-    SensorObstacleDx = dx;
-    SensorObstacleDy = dy;
-
-    if (ObjectSensorLogCounter++ % 1000 == 0
-        || nearestObjectId != PreviousDetectedObjectId) {
-        Log("Object sensor: dtct=%d dx=%.3f m dy=%.3f m ObjId=%d\n",
-            detected, dx, dy, nearestObjectId);
-    }
-    PreviousDetectedObjectId = nearestObjectId;
+    SensorObstacles = detectedObstacles;
+    SensorObstacleCount = detectedObstacleCount;
+    User.Out[8] = NearestObstacleDx();
+    User.Out[9] = NearestObstacleDy();
 }
 
 } /* namespace */
@@ -695,12 +747,10 @@ User_TestRun_Start_atEnd(void)
     MountedObjectSensorIndex = ObjectSensor_FindIndexForName(ObjectSensorName);
     MountedObjectSensor = MountedObjectSensorIndex >= 0
         ? ObjectSensor_GetByIndex(MountedObjectSensorIndex) : nullptr;
-    ObjectSensorLogCounter = 0;
-    PreviousDetectedObjectId = -1;
-    SensorObstacleDetected = false;
-    SensorObstacleDx = MountedObjectSensor == nullptr ? 999.0 : 0.0;
-    SensorObstacleDy = 0.0;
-    SensorObstacleActive = false;
+    SensorObstacles = {};
+    SensorObstacleCount = 0;
+    SensorObstacleReferenceRoadDistance = 0.0;
+    SensorObstacleReferenceLateralPosition = 0.0;
 
     if (MountedObjectSensor == nullptr) {
         LogWarnF(EC_Init, "Object sensor '%s' was not found; continuing without sensor obstacle",
@@ -868,7 +918,6 @@ User_DrivMan_Calc(double dt)
         lastValidMppiCommand = 0.0;
         mppiController.Reset();
         logCounter = 0;
-        SensorObstacleActive = false;
         User.Out[0] = 0.0;
         User.Out[1] = Vehicle.Road.Path.tRoad;
         User.Out[2] = -Vehicle.Road.Path.tRoad;
@@ -877,8 +926,8 @@ User_DrivMan_Calc(double dt)
         User.Out[5] = 0.0;
         User.Out[6] = 0.0;
         User.Out[7] = 0.0;
-        User.Out[8] = SensorObstacleDx;
-        User.Out[9] = SensorObstacleDy;
+        User.Out[8] = NearestObstacleDx();
+        User.Out[9] = NearestObstacleDy();
         return 0;
     }
 
@@ -904,11 +953,8 @@ User_DrivMan_Calc(double dt)
 
     const double distanceFromControlStart = controlReferenceInitialized
         ? Vehicle.sRoad - controlStartRoadPosition : 0.0;
-    SensorObstacleActive = SensorObstacleDetected && SensorObstacleDx > 0.0;
-    if (SensorObstacleActive) {
-        SensorObstacleRoadDistance = distanceFromControlStart + SensorObstacleDx;
-        SensorObstacleLateralPosition = Vehicle.Road.Path.tRoad + SensorObstacleDy;
-    }
+    SensorObstacleReferenceRoadDistance = distanceFromControlStart;
+    SensorObstacleReferenceLateralPosition = Vehicle.Road.Path.tRoad;
     constexpr double desiredLateralPosition = 0.0;
     constexpr double desiredHeadingRelativeToRoad = 0.0;
     const double roadHeading = atan2(Vehicle.Road.Path.X_0[1], Vehicle.Road.Path.X_0[0]);
@@ -975,14 +1021,32 @@ User_DrivMan_Calc(double dt)
     User.Out[6] = mppiBestCost;
     User.Out[7] = controllerMode == ControllerMode::Mppi ? 1.0
         : (controllerMode == ControllerMode::Recovery ? 2.0 : 0.0);
-    User.Out[8] = SensorObstacleDx;
-    User.Out[9] = SensorObstacleDy;
+    User.Out[8] = NearestObstacleDx();
+    User.Out[9] = NearestObstacleDy();
 
     if (logCounter++ % 1000 == 0) {
-        Log("Steering control: speedState=%s obstacle dtct=%d dx=%.1f m dy=%.3f m "
-            "command=%.2f deg cost=%.2f mode=%s\n",
-            SpeedStateName(speedState), SensorObstacleDetected ? 1 : 0,
-            SensorObstacleDx, SensorObstacleDy,
+        char obstacleIds[96] = "none";
+        if (SensorObstacleCount > 0) {
+            size_t offset = 0;
+            obstacleIds[0] = '\0';
+            for (int i = 0; i < SensorObstacleCount; ++i) {
+                const int written = snprintf(
+                    obstacleIds + offset, sizeof(obstacleIds) - offset,
+                    i == 0 ? "%d" : ",%d", SensorObstacles[i].objId);
+                if (written < 0
+                    || static_cast<size_t>(written) >= sizeof(obstacleIds) - offset) {
+                    break;
+                }
+                offset += static_cast<size_t>(written);
+            }
+        }
+
+        const int nearestObjectId = SensorObstacleCount > 0
+            ? SensorObstacles[0].objId : -1;
+        Log("Steering control: speedState=%s obstacleCount=%d nearest dx=%.1f m "
+            "dy=%.3f m id=%d ids=%s command=%.2f deg cost=%.2f mode=%s\n",
+            SpeedStateName(speedState), SensorObstacleCount,
+            NearestObstacleDx(), NearestObstacleDy(), nearestObjectId, obstacleIds,
             steeringCommand * 180.0 / Pi, mppiBestCost,
             ControllerModeName(controllerMode));
     }
@@ -1076,7 +1140,7 @@ User_Calc(double dt)
         Log("Vehicle speed: %f\n", Vehicle.v);
     }
 
-    ReadNearestDetectedObject();
+    ReadDetectedObstacles();
 
     return 0;
 }
