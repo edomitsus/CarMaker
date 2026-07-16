@@ -18,7 +18,7 @@ When adding new functionality:
 Author: Edison Suzuki
 
 Last Updated:
-2026-07-15
+2026-07-16
 
 ---
 
@@ -112,6 +112,10 @@ Current controller
 Steering-only MPPI
 
 Fallback controller still exists and is used when MPPI returns invalid.
+
+Low-speed recovery distinguishes startup from a stall after the vehicle has moved.
+
+During a stall, steering uses a gentle command derived from the last valid MPPI command instead of saturated fallback steering.
 
 ---
 
@@ -230,29 +234,19 @@ Replace sine reference with lane-center tracking.
 
 ---
 
-# 9. Hard-coded Obstacle
+# 9. Object Sensor Obstacle
 
 Current implementation
 
-Single obstacle
+Mounted Object Sensor
 
-MPPI successfully
+VehSensor_0 / OB00
 
-- anticipates obstacle
-- moves around obstacle
-- returns to lane
+The nearest detected object supplies dx and dy.
 
-Observed
+Obstacle cost is active only when dtct == 1 and dx > 0.
 
-Maximum lateral position
-
-approximately
-
-3.25 m
-
-Desired improvement
-
-Reduce overshoot.
+No hard-coded obstacle position remains.
 
 ---
 
@@ -294,6 +288,8 @@ Controller mode
 
 0 = fallback
 
+2 = recovery
+
 User.Out[8]
 
 Reserved
@@ -333,6 +329,18 @@ controller active
 mode=fallback
 
 fallback controller active
+
+mode=RECOVERY
+
+low-speed recovery active after the vehicle has previously exceeded 1 m/s
+
+Speed state logging
+
+STARTUP = vehicle has not yet exceeded 1 m/s
+
+MOVING = vehicle has exceeded 1 m/s and is currently at or above 1 m/s
+
+STALLED = vehicle previously exceeded 1 m/s and is currently below 1 m/s
 
 ---
 
@@ -436,13 +444,9 @@ MPPI obstacle
 
 Current
 
-Hard-coded obstacle
-
-Next
-
 Object Sensor
 
-OB00
+VehSensor_0 / OB00
 
 Steps
 
@@ -470,7 +474,7 @@ to obstacle position.
 
 5.
 
-Replace hard-coded obstacle.
+Use the detected object as the MPPI obstacle.
 
 ---
 
@@ -596,7 +600,9 @@ The controller
 - samples steering trajectories,
 - evaluates trajectory cost,
 - updates the nominal steering sequence,
-- avoids a hard-coded obstacle,
+- uses the mounted Object Sensor as its only obstacle source,
 - returns toward lane center.
 
-The next major milestone is replacing the hard-coded obstacle with a CarMaker Object Sensor while keeping the MPPI algorithm unchanged.
+The sensor obstacle cost is disabled when no forward object is detected.
+
+Low speed after prior movement enters RECOVERY mode rather than permanently switching to fallback steering.

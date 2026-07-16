@@ -87,6 +87,7 @@
 
 #include <CarMaker.h>
 # include <Car/Vehicle_Car.h>
+#include <Vehicle/Sensor_Object.h>
 
 #include <ADASRP.h>
 
@@ -105,18 +106,62 @@ namespace {
 
 constexpr double Pi = 3.14159265358979323846;
 
-/* Fake obstacle in road coordinates, measured from controller activation. */
-constexpr double ObstacleRoadDistance = 300.0;            /* [m] */
-constexpr double ObstacleLateralPosition = 0.0;           /* road center [m] */
+/* Object Sensor obstacle cost envelope. */
 constexpr double ObstacleLongitudinalRadius = 25.0;       /* avoidance envelope [m] */
 constexpr double ObstacleLateralRadius = 1.75;            /* avoidance envelope [m] */
 constexpr double PreferredPassingLateralPosition = 2.25;  /* deterministic left pass [m] */
 constexpr double RoadSoftLateralLimit = 3.0;              /* assumed usable half-width [m] */
 constexpr double RoadHardLateralLimit = 4.0;              /* strong edge penalty [m] */
 
+bool SensorObstacleDetected = false;
+double SensorObstacleDx = 0.0;
+double SensorObstacleDy = 0.0;
+bool SensorObstacleActive = false;
+double SensorObstacleRoadDistance = 0.0;
+double SensorObstacleLateralPosition = 0.0;
+
 constexpr double SteeringLimit = 15.0 * Pi / 180.0;      /* steering-wheel angle [rad] */
 constexpr double SteeringRateLimit = 30.0 * Pi / 180.0;  /* [rad/s] */
 constexpr double SteeringAccelerationLimit = 2.0;        /* [rad/s^2] */
+constexpr double RecoverySteeringLimit = 5.0 * Pi / 180.0; /* gentle stalled recovery [rad] */
+
+enum class SpeedState {
+    Startup,
+    Moving,
+    Stalled
+};
+
+enum class ControllerMode {
+    Fallback,
+    Mppi,
+    Recovery
+};
+
+char const *
+SpeedStateName(SpeedState state)
+{
+    switch (state) {
+    case SpeedState::Moving:
+        return "MOVING";
+    case SpeedState::Stalled:
+        return "STALLED";
+    default:
+        return "STARTUP";
+    }
+}
+
+char const *
+ControllerModeName(ControllerMode mode)
+{
+    switch (mode) {
+    case ControllerMode::Mppi:
+        return "MPPI";
+    case ControllerMode::Recovery:
+        return "RECOVERY";
+    default:
+        return "FALLBACK";
+    }
+}
 
 constexpr int MppiSamples = 256;
 constexpr int MppiHorizon = 60;
@@ -149,10 +194,14 @@ WrapAngle(double angle)
 double
 ObstacleCost(double roadDistance, double lateralPosition)
 {
+    if (!SensorObstacleActive) {
+        return 0.0;
+    }
+
     const double longitudinalSeparation =
-        (roadDistance - ObstacleRoadDistance) / ObstacleLongitudinalRadius;
+        (roadDistance - SensorObstacleRoadDistance) / ObstacleLongitudinalRadius;
     const double lateralSeparation =
-        (lateralPosition - ObstacleLateralPosition) / ObstacleLateralRadius;
+        (lateralPosition - SensorObstacleLateralPosition) / ObstacleLateralRadius;
     const double normalizedDistanceSquared =
         longitudinalSeparation * longitudinalSeparation
         + lateralSeparation * lateralSeparation;
@@ -310,6 +359,61 @@ private:
     std::mt19937 RandomGenerator;
     std::normal_distribution<double> NormalDistribution;
 };
+
+} /* namespace */
+
+namespace {
+
+constexpr char ObjectSensorName[] = "VehSensor_0";
+
+int MountedObjectSensorIndex = -1;
+tObjectSensor *MountedObjectSensor = nullptr;
+unsigned int ObjectSensorLogCounter = 0;
+int PreviousDetectedObjectId = -1;
+
+void
+ReadNearestDetectedObject()
+{
+    int detected = 0;
+    int nearestObjectId = -1;
+    double nearestDistance = std::numeric_limits<double>::infinity();
+    double dx = MountedObjectSensor == nullptr ? 999.0 : 0.0;
+    double dy = 0.0;
+
+    if (MountedObjectSensor != nullptr) {
+        for (int i = 0; i < MountedObjectSensor->nObsvObjects; ++i) {
+            const int objectId = MountedObjectSensor->ObsvObjects[i];
+            tObjectSensorObj *object =
+                ObjectSensor_GetObjectByObjId(MountedObjectSensorIndex, objectId);
+
+            if (object == nullptr || object->dtct == 0
+                || !std::isfinite(object->NearPnt.ds_p)) {
+                continue;
+            }
+
+            if (object->NearPnt.ds_p < nearestDistance) {
+                detected = 1;
+                nearestObjectId = object->ObjId;
+                nearestDistance = object->NearPnt.ds_p;
+                dx = object->NearPnt.ds[0];
+                dy = object->NearPnt.ds[1];
+            }
+        }
+    }
+
+    User.Out[8] = dx;
+    User.Out[9] = dy;
+    SensorObstacleDetected = detected != 0;
+    SensorObstacleDx = dx;
+    SensorObstacleDy = dy;
+
+    if (ObjectSensorLogCounter++ % 1000 == 0
+        || nearestObjectId != PreviousDetectedObjectId) {
+        Log("Object sensor: dtct=%d dx=%.3f m dy=%.3f m ObjId=%d\n",
+            detected, dx, dy, nearestObjectId);
+    }
+    PreviousDetectedObjectId = nearestObjectId;
+}
 
 } /* namespace */
 
@@ -588,6 +692,26 @@ User_TestRun_Start_atBegin(void)
 int
 User_TestRun_Start_atEnd(void)
 {
+    MountedObjectSensorIndex = ObjectSensor_FindIndexForName(ObjectSensorName);
+    MountedObjectSensor = MountedObjectSensorIndex >= 0
+        ? ObjectSensor_GetByIndex(MountedObjectSensorIndex) : nullptr;
+    ObjectSensorLogCounter = 0;
+    PreviousDetectedObjectId = -1;
+    SensorObstacleDetected = false;
+    SensorObstacleDx = MountedObjectSensor == nullptr ? 999.0 : 0.0;
+    SensorObstacleDy = 0.0;
+    SensorObstacleActive = false;
+
+    if (MountedObjectSensor == nullptr) {
+        LogWarnF(EC_Init, "Object sensor '%s' was not found; continuing without sensor obstacle",
+            ObjectSensorName);
+        User.Out[8] = 999.0;
+        User.Out[9] = 0.0;
+    } else {
+        Log("Object sensor '%s' initialized at index %d\n",
+            ObjectSensorName, MountedObjectSensorIndex);
+    }
+
     return 0;
 }
 
@@ -724,6 +848,8 @@ User_DrivMan_Calc(double dt)
     static double mppiRequestedSteering = 0.0;
     static double mppiBestCost = 0.0;
     static bool mppiValid = false;
+    static bool hasLastValidMppiCommand = false;
+    static double lastValidMppiCommand = 0.0;
     static unsigned int logCounter = 0;
 
     /* Rely on the Vehicle Operator within DrivMan module to get
@@ -738,8 +864,11 @@ User_DrivMan_Calc(double dt)
         mppiRequestedSteering = 0.0;
         mppiBestCost = 0.0;
         mppiValid = false;
+        hasLastValidMppiCommand = false;
+        lastValidMppiCommand = 0.0;
         mppiController.Reset();
         logCounter = 0;
+        SensorObstacleActive = false;
         User.Out[0] = 0.0;
         User.Out[1] = Vehicle.Road.Path.tRoad;
         User.Out[2] = -Vehicle.Road.Path.tRoad;
@@ -748,8 +877,8 @@ User_DrivMan_Calc(double dt)
         User.Out[5] = 0.0;
         User.Out[6] = 0.0;
         User.Out[7] = 0.0;
-        User.Out[8] = ObstacleRoadDistance;
-        User.Out[9] = 0.0;
+        User.Out[8] = SensorObstacleDx;
+        User.Out[9] = SensorObstacleDy;
         return 0;
     }
 
@@ -768,8 +897,18 @@ User_DrivMan_Calc(double dt)
         mppiController.Reset();
     }
 
+    const SpeedState speedState = !controlReferenceInitialized
+        ? SpeedState::Startup
+        : (vehicleSpeed < 1.0 ? SpeedState::Stalled : SpeedState::Moving);
+    ControllerMode controllerMode = ControllerMode::Fallback;
+
     const double distanceFromControlStart = controlReferenceInitialized
         ? Vehicle.sRoad - controlStartRoadPosition : 0.0;
+    SensorObstacleActive = SensorObstacleDetected && SensorObstacleDx > 0.0;
+    if (SensorObstacleActive) {
+        SensorObstacleRoadDistance = distanceFromControlStart + SensorObstacleDx;
+        SensorObstacleLateralPosition = Vehicle.Road.Path.tRoad + SensorObstacleDy;
+    }
     constexpr double desiredLateralPosition = 0.0;
     constexpr double desiredHeadingRelativeToRoad = 0.0;
     const double roadHeading = atan2(Vehicle.Road.Path.X_0[1], Vehicle.Road.Path.X_0[0]);
@@ -782,7 +921,7 @@ User_DrivMan_Calc(double dt)
         FallbackLateralGain * lateralError + FallbackHeadingGain * headingError,
         -SteeringLimit, SteeringLimit);
 
-    if (controlReferenceInitialized && vehicleSpeed > 1.0) {
+    if (speedState == SpeedState::Moving) {
         mppiUpdateTimer += dt;
         if (mppiUpdateTimer >= MppiUpdatePeriod) {
             const MppiResult result = mppiController.Update(
@@ -792,10 +931,23 @@ User_DrivMan_Calc(double dt)
             mppiBestCost = result.BestCost;
             mppiValid = result.Valid;
             mppiRequestedSteering = result.Valid ? result.Command : fallbackSteering;
+            if (result.Valid) {
+                hasLastValidMppiCommand = true;
+                lastValidMppiCommand = result.Command;
+            }
         }
+        controllerMode = mppiValid ? ControllerMode::Mppi : ControllerMode::Fallback;
+    } else if (speedState == SpeedState::Stalled) {
+        mppiValid = false;
+        const double recoverySource = hasLastValidMppiCommand
+            ? lastValidMppiCommand : fallbackSteering;
+        mppiRequestedSteering = Clamp(
+            recoverySource, -RecoverySteeringLimit, RecoverySteeringLimit);
+        controllerMode = ControllerMode::Recovery;
     } else {
         mppiValid = false;
         mppiRequestedSteering = fallbackSteering;
+        controllerMode = ControllerMode::Fallback;
     }
 
     const double previousSteeringCommand = steeringCommand;
@@ -821,15 +973,18 @@ User_DrivMan_Calc(double dt)
     User.Out[4] = steeringCommand;
     User.Out[5] = mppiRequestedSteering;
     User.Out[6] = mppiBestCost;
-    User.Out[7] = mppiValid ? 1.0 : 0.0;
-    User.Out[8] = ObstacleRoadDistance - distanceFromControlStart;
-    User.Out[9] = ObstacleCost(distanceFromControlStart, Vehicle.Road.Path.tRoad);
+    User.Out[7] = controllerMode == ControllerMode::Mppi ? 1.0
+        : (controllerMode == ControllerMode::Recovery ? 2.0 : 0.0);
+    User.Out[8] = SensorObstacleDx;
+    User.Out[9] = SensorObstacleDy;
 
     if (logCounter++ % 1000 == 0) {
-        Log("MPPI obstacle: ahead=%.1f m lateral=%.3f m command=%.2f deg cost=%.2f mode=%s\n",
-            ObstacleRoadDistance - distanceFromControlStart, Vehicle.Road.Path.tRoad,
+        Log("Steering control: speedState=%s obstacle dtct=%d dx=%.1f m dy=%.3f m "
+            "command=%.2f deg cost=%.2f mode=%s\n",
+            SpeedStateName(speedState), SensorObstacleDetected ? 1 : 0,
+            SensorObstacleDx, SensorObstacleDy,
             steeringCommand * 180.0 / Pi, mppiBestCost,
-            mppiValid ? "MPPI" : "fallback");
+            ControllerModeName(controllerMode));
     }
 
     return 0;
@@ -920,6 +1075,8 @@ User_Calc(double dt)
     if (count++ % 1000 == 0) {
         Log("Vehicle speed: %f\n", Vehicle.v);
     }
+
+    ReadNearestDetectedObject();
 
     return 0;
 }
