@@ -87,6 +87,7 @@
 
 #include <CarMaker.h>
 # include <Car/Vehicle_Car.h>
+#include <Road.h>
 #include <Vehicle/Sensor_Object.h>
 
 #include <ADASRP.h>
@@ -110,8 +111,11 @@ constexpr double Pi = 3.14159265358979323846;
 constexpr double ObstacleLongitudinalRadius = 25.0;       /* avoidance envelope [m] */
 constexpr double ObstacleLateralRadius = 1.75;            /* avoidance envelope [m] */
 constexpr double PreferredPassingLateralPosition = 2.25;  /* deterministic left pass [m] */
-constexpr double RoadSoftLateralLimit = 3.0;              /* assumed usable half-width [m] */
-constexpr double RoadHardLateralLimit = 4.0;              /* strong edge penalty [m] */
+constexpr double RoadSafetyMargin = 0.5;                  /* edge approach margin [m] */
+constexpr double DefaultRoadWidth = 6.0;                  /* conservative eval fallback [m] */
+
+tRoadEval *MppiRoadEval = nullptr;
+double RoadEvaluationSOffset = 0.0;
 
 struct Obstacle {
     bool valid;
@@ -248,16 +252,36 @@ ObstacleCost(double roadDistance, double lateralPosition)
 }
 
 double
-RoadBoundaryCost(double lateralPosition)
+RoadBoundaryCost(double roadDistance, double lateralPosition)
 {
+    double roadWidth = DefaultRoadWidth;
+    if (MppiRoadEval != nullptr) {
+        tRoadRouteIn rIn{};
+        tRoadRouteOut rOut{};
+        rIn.st[0] = RoadEvaluationSOffset + roadDistance;
+        rIn.st[1] = lateralPosition;
+
+        if (RoadRouteEval(MppiRoadEval, nullptr, RIT_ST, &rIn, &rOut) == ROAD_Ok
+            && std::isfinite(rOut.width[0]) && rOut.width[0] > 0.0
+            && std::isfinite(rOut.width[1]) && rOut.width[1] > 0.0) {
+            const double evaluatedRoadWidth = rOut.width[0] + rOut.width[1];
+            if (std::isfinite(evaluatedRoadWidth) && evaluatedRoadWidth > 0.0) {
+                roadWidth = evaluatedRoadWidth;
+            }
+        }
+    }
+
+    const double halfRoadWidth = 0.5 * roadWidth;
+    const double softLimit = fmax(0.0, halfRoadWidth - RoadSafetyMargin);
+    const double hardLimit = halfRoadWidth;
     const double absoluteLateralPosition = fabs(lateralPosition);
     double cost = 0.0;
-    if (absoluteLateralPosition > RoadSoftLateralLimit) {
-        const double excess = absoluteLateralPosition - RoadSoftLateralLimit;
+    if (absoluteLateralPosition > softLimit) {
+        const double excess = absoluteLateralPosition - softLimit;
         cost += 500.0 * excess * excess;
     }
-    if (absoluteLateralPosition > RoadHardLateralLimit) {
-        const double excess = absoluteLateralPosition - RoadHardLateralLimit;
+    if (absoluteLateralPosition > hardLimit) {
+        const double excess = absoluteLateralPosition - hardLimit;
         cost += 5000.0 * (1.0 + excess * excess);
     }
     return cost;
@@ -330,7 +354,7 @@ public:
                     + 0.2 * steering * steering
                     + 0.5 * controlChange * controlChange
                     + ObstacleCost(predictedDistance, predictedLateralPosition)
-                    + RoadBoundaryCost(predictedLateralPosition);
+                    + RoadBoundaryCost(predictedDistance, predictedLateralPosition);
                 const double explorationCost = MppiTemperature
                     * NominalControl[step] * noise / noiseVariance;
                 cost += MppiStep * (runningCost + explorationCost);
@@ -342,7 +366,7 @@ public:
             cost += 12.0 * terminalLateralError * terminalLateralError
                 + 100.0 * terminalHeadingError * terminalHeadingError
                 + ObstacleCost(predictedDistance, predictedLateralPosition)
-                + RoadBoundaryCost(predictedLateralPosition);
+                + RoadBoundaryCost(predictedDistance, predictedLateralPosition);
 
             Costs[sample] = cost;
             minimumCost = fmin(minimumCost, cost);
@@ -744,6 +768,24 @@ User_TestRun_Start_atBegin(void)
 int
 User_TestRun_Start_atEnd(void)
 {
+    if (MppiRoadEval != nullptr) {
+        RoadDeleteRoadEval(MppiRoadEval);
+        MppiRoadEval = nullptr;
+    }
+
+    MppiRoadEval = RoadNewRoadEval(
+        Env.Road, ROAD_BUMP_NONE, ROAD_OT_WIDTH | ROAD_OT_LANES, "User.MPPI");
+    if (MppiRoadEval == nullptr
+        || RoadEvalSetRouteByObjId(MppiRoadEval, Env.Route.ObjId, 1) != ROAD_Ok) {
+        LogWarnF(EC_Init,
+            "MPPI road evaluation could not use the active route; using fallback width");
+        if (MppiRoadEval != nullptr) {
+            RoadDeleteRoadEval(MppiRoadEval);
+            MppiRoadEval = nullptr;
+        }
+    }
+    RoadEvaluationSOffset = 0.0;
+
     MountedObjectSensorIndex = ObjectSensor_FindIndexForName(ObjectSensorName);
     MountedObjectSensor = MountedObjectSensorIndex >= 0
         ? ObjectSensor_GetByIndex(MountedObjectSensorIndex) : nullptr;
@@ -850,6 +892,11 @@ User_TestRun_End_First(void)
 int
 User_TestRun_End(void)
 {
+    if (MppiRoadEval != nullptr) {
+        RoadDeleteRoadEval(MppiRoadEval);
+        MppiRoadEval = nullptr;
+    }
+
     return 0;
 }
 
@@ -953,6 +1000,8 @@ User_DrivMan_Calc(double dt)
 
     const double distanceFromControlStart = controlReferenceInitialized
         ? Vehicle.sRoad - controlStartRoadPosition : 0.0;
+    RoadEvaluationSOffset = controlReferenceInitialized
+        ? controlStartRoadPosition : Vehicle.sRoad;
     SensorObstacleReferenceRoadDistance = distanceFromControlStart;
     SensorObstacleReferenceLateralPosition = Vehicle.Road.Path.tRoad;
     constexpr double desiredLateralPosition = 0.0;

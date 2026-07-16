@@ -210,6 +210,14 @@ Negative total costs are possible.
 
 Negative cost is NOT an error.
 
+Road boundary cost
+
+- Uses RoadRouteEval with RIT_ST for every predicted state.
+- The RoadEval handle is bound to the active route with path evaluation enabled.
+- Soft limit is half the evaluated path width minus a 0.5 m safety margin.
+- Hard limit is half the evaluated path width.
+- A conservative 6 m total width is used only when evaluation fails for a step.
+
 ---
 
 # 8. Current Reference
@@ -610,6 +618,7 @@ The controller
 - updates the nominal steering sequence,
 - uses the mounted Object Sensor as its only obstacle source,
 - evaluates up to eight detected obstacles per rollout state,
+- evaluates road boundaries from active-route geometry,
 - returns toward lane center.
 
 The sensor obstacle cost is disabled when no forward object is detected.
