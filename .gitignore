@@ -30,7 +30,7 @@ src_cm4sl/CarMaker.*.exe
 # Temporary files
 *.tmp
 *.bak
-Data/TestRun/.tmp_*
+Data/*/.tmp_*
 
 # Local CarMaker preferences
 Data/Config/Preferences.sce

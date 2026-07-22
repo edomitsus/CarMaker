@@ -109,7 +109,7 @@ constexpr double Pi = 3.14159265358979323846;
 
 /* Object Sensor obstacle cost envelope. */
 constexpr double ObstacleLongitudinalRadius = 25.0;       /* avoidance envelope [m] */
-constexpr double ObstacleLateralRadius = 1.75;            /* avoidance envelope [m] */
+constexpr double ObstacleLateralRadius = 1.75;             /* avoidance envelope [m] */
 constexpr double PreferredPassingLateralPosition = 2.25;  /* deterministic left pass [m] */
 constexpr double RoadSafetyMargin = 0.5;                  /* edge approach margin [m] */
 constexpr double DefaultRoadWidth = 6.0;                  /* conservative eval fallback [m] */
@@ -287,6 +287,39 @@ RoadBoundaryCost(double roadDistance, double lateralPosition)
     return cost;
 }
 
+/* Curvature-aware rollout: without this, the kinematic model below tracks
+   predictedHeading relative to a single ROAD HEADING SNAPSHOT taken at the
+   start of the horizon (t=0), so on a curving road it silently assumes the
+   road keeps going straight in whatever direction it currently points -
+   increasingly wrong the further the 4.5 s/~90 m horizon looks ahead. This
+   reads the road's own curvature (1/m) at the predicted point so the
+   rollout can bend predictedHeading's reference along with the actual
+   road, not just a frozen initial direction.
+   Sign convention: matches the existing t-positive-left assumption used
+   throughout (see PreferredPassingLateralPosition); unverified empirically
+   for curveXY specifically - if the vehicle drifts the wrong way on a
+   curve, flip the sign where this is used below. Returns 0.0 (today's
+   straight-road assumption) when curvature data isn't available. */
+double
+RoadCurvature(double roadDistance, double lateralPosition)
+{
+    if (MppiRoadEval == nullptr) {
+        return 0.0;
+    }
+
+    tRoadRouteIn rIn{};
+    tRoadRouteOut rOut{};
+    rIn.st[0] = RoadEvaluationSOffset + roadDistance;
+    rIn.st[1] = lateralPosition;
+
+    if (RoadRouteEval(MppiRoadEval, nullptr, RIT_ST, &rIn, &rOut) != ROAD_Ok
+        || !std::isfinite(rOut.curveXY)) {
+        return 0.0;
+    }
+
+    return rOut.curveXY;
+}
+
 struct MppiResult {
     double Command;
     double BestCost;
@@ -339,10 +372,13 @@ public:
                 previousNoise = noise;
 
                 const double frontWheelAngle = steering / MppiSteeringRatio;
-                predictedDistance += speed * cos(predictedHeading) * MppiStep;
+                const double roadCurvature = RoadCurvature(predictedDistance, predictedLateralPosition);
+                const double stepDistance = speed * cos(predictedHeading) * MppiStep;
+                predictedDistance += stepDistance;
                 predictedLateralPosition += speed * sin(predictedHeading) * MppiStep;
                 predictedHeading = WrapAngle(predictedHeading
-                    + speed / MppiWheelbase * tan(frontWheelAngle) * MppiStep);
+                    + speed / MppiWheelbase * tan(frontWheelAngle) * MppiStep
+                    - roadCurvature * stepDistance);
 
                 const double lateralError = -predictedLateralPosition;
                 const double headingError = WrapAngle(-predictedHeading);
@@ -1124,7 +1160,7 @@ User_VehicleControl_Calc(double dt)
     static bool first = true;
 
     if (first) {
-        Log("BUILD STAMP: MPPI_TEST_2026_07_15_1618\n");
+        Log("BUILD STAMP: CURVATURE_SIGN_REVERT_V5 (built %s %s)\n", __DATE__, __TIME__);
         Log("User_VehicleControl_Calc() is running!");
         first = false;
     }
