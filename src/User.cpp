@@ -196,6 +196,30 @@ constexpr double MppiNoiseCorrelation = 0.70;
 constexpr double MppiWheelbase = 2.8;                    /* bicycle-model wheelbase [m] */
 constexpr double MppiSteeringRatio = 16.0;               /* steering wheel / road wheel */
 
+/* Reduced, not zeroed (see doc/PROJECT_CONTEXT.md "separate road-following
+   from obstacle avoidance" task): lane-centering is primarily IPGDriver's
+   baseline's job now (added back in via SteeringMppi::Update()'s
+   baselineSteering parameter), so this is far below the original 4.0/12.0
+   to avoid MPPI's delta double-fighting a baseline that's already doing
+   the job. But fully zeroing it (tried first) left MPPI's delta with NO
+   restoring pull at all - if the baseline ever settles away from tRoad=0
+   (observed: ~2 m sustained offset on the circle track, cause unconfirmed,
+   possibly a lane-offset setting or a leftover avoidance maneuver), nothing
+   corrected it, and it compounded into a road departure once an obstacle's
+   avoidance delta pushed the same direction as the existing drift. This
+   keeps a small non-zero pull so a persistent baseline offset gets slowly
+   corrected instead of accumulating indefinitely. */
+constexpr double LaneCenterWeight = 1.0;
+constexpr double TerminalLaneCenterWeight = 3.0;
+
+/* DEBUG toggle: set to false to disable MPPI (and the fallback/recovery
+   steering paths) entirely and run with IPGDriver's own baseline steering
+   only, completely untouched - useful for seeing how the vehicle handles
+   the track/route with no additional control layered on top at all.
+   Compile-time, like BestFeasibleRolloutMode-style toggles elsewhere in
+   this file: flip and rebuild. */
+constexpr bool MppiEnabled = false;
+
 double
 Clamp(double value, double lower, double upper)
 {
@@ -238,9 +262,21 @@ ObstacleCost(double roadDistance, double lateralPosition)
             + lateralSeparation * lateralSeparation;
 
         double cost = 250.0 * exp(-0.5 * normalizedDistanceSquared);
+        /* FIX: passingGate previously only depended on longitudinal
+           distance, so the "prefer to pass on the left" pull toward
+           PreferredPassingLateralPosition activated for ANY object within
+           ObstacleLongitudinalRadius, even ones tens of meters off to the
+           side (e.g. dy=30 m) that pose no real collision risk - causing
+           unwanted lane drift whenever such an object happened to be
+           nearby in distance. lateralGate (reusing the same
+           lateralSeparation already computed above, so no extra cost)
+           makes the passing preference fade out for objects that aren't
+           actually near the vehicle's path, the same envelope the
+           collision cost itself already uses. */
         const double passingGate = exp(-0.5 * longitudinalSeparation * longitudinalSeparation);
+        const double lateralGate = exp(-0.5 * lateralSeparation * lateralSeparation);
         const double passingError = lateralPosition - PreferredPassingLateralPosition;
-        cost += 3.0 * passingGate * passingError * passingError;
+        cost += 3.0 * passingGate * lateralGate * passingError * passingError;
         if (normalizedDistanceSquared < 1.0) {
             const double penetration = 1.0 - normalizedDistanceSquared;
             cost += 2000.0 + 8000.0 * penetration * penetration;
@@ -342,9 +378,21 @@ public:
         NormalDistribution.reset();
     }
 
+    /* baselineSteering: IPGDriver's own steering-wheel command for this
+       cycle (see doc/PROJECT_CONTEXT.md "separate road-following from
+       obstacle avoidance" task). MPPI no longer tries to track lane-center
+       on its own (LaneCenterWeight below is 0) - that's IPGDriver's job,
+       with its own steering authority, unrestricted by SteeringLimit.
+       MPPI's sampled `steering` is now purely an avoidance DELTA, added to
+       baselineSteering both in the rollout's kinematics (held constant
+       across the horizon - a fair approximation on a constant-or-slowly-
+       varying-radius curve) and in the executed command (see
+       User_DrivMan_Calc). This is why a tight curve that exceeds
+       SteeringLimit on its own can still be followed: the baseline
+       supplies the large turn, MPPI only adds a small avoidance nudge. */
     MppiResult Update(double roadDistance, double lateralPosition,
                       double headingRelativeToRoad, double speed,
-                      double previousAppliedSteering)
+                      double previousAppliedSteering, double baselineSteering)
     {
         double minimumCost = std::numeric_limits<double>::infinity();
         const double correlationScale = sqrt(1.0 - MppiNoiseCorrelation * MppiNoiseCorrelation);
@@ -371,7 +419,7 @@ public:
                 Noise[sample][step] = noise;
                 previousNoise = noise;
 
-                const double frontWheelAngle = steering / MppiSteeringRatio;
+                const double frontWheelAngle = (baselineSteering + steering) / MppiSteeringRatio;
                 const double roadCurvature = RoadCurvature(predictedDistance, predictedLateralPosition);
                 const double stepDistance = speed * cos(predictedHeading) * MppiStep;
                 predictedDistance += stepDistance;
@@ -385,7 +433,7 @@ public:
                 const double controlChange = steering - previousControl;
 
                 const double runningCost =
-                    4.0 * lateralError * lateralError
+                    LaneCenterWeight * lateralError * lateralError
                     + 60.0 * headingError * headingError
                     + 0.2 * steering * steering
                     + 0.5 * controlChange * controlChange
@@ -399,7 +447,7 @@ public:
 
             const double terminalLateralError = -predictedLateralPosition;
             const double terminalHeadingError = WrapAngle(-predictedHeading);
-            cost += 12.0 * terminalLateralError * terminalLateralError
+            cost += TerminalLaneCenterWeight * terminalLateralError * terminalLateralError
                 + 100.0 * terminalHeadingError * terminalHeadingError
                 + ObstacleCost(predictedDistance, predictedLateralPosition)
                 + RoadBoundaryCost(predictedDistance, predictedLateralPosition);
@@ -810,7 +858,7 @@ User_TestRun_Start_atEnd(void)
     }
 
     MppiRoadEval = RoadNewRoadEval(
-        Env.Road, ROAD_BUMP_NONE, ROAD_OT_WIDTH | ROAD_OT_LANES, "User.MPPI");
+        Env.Road, ROAD_BUMP_NONE, ROAD_OT_WIDTH | ROAD_OT_LANES | ROAD_OT_CURVE_XY, "User.MPPI");
     if (MppiRoadEval == nullptr
         || RoadEvalSetRouteByObjId(MppiRoadEval, Env.Route.ObjId, 1) != ROAD_Ok) {
         LogWarnF(EC_Init,
@@ -970,8 +1018,19 @@ User_DrivMan_Calc(double dt)
     static bool firstDrivMan = true;
     if (firstDrivMan) {
         Log("User_DrivMan_Calc() is running!\n");
+        Log(MppiEnabled
+            ? "MPPI steering: ENABLED\n"
+            : "MPPI steering: DISABLED - running IPGDriver baseline steering untouched\n");
         firstDrivMan = false;
     }
+
+    if (!MppiEnabled) {
+        /* Leave DrivMan.Steering exactly as the core DrivMan_Calc() (which
+           already ran this cycle) computed it - no MPPI, no fallback, no
+           recovery, no obstacle avoidance. Pure baseline route-following. */
+        return 0;
+    }
+
     static SteeringMppi mppiController;
     static double controlStartRoadPosition = 0.0;
     static bool controlReferenceInitialized = false;
@@ -983,6 +1042,12 @@ User_DrivMan_Calc(double dt)
     static bool mppiValid = false;
     static bool hasLastValidMppiCommand = false;
     static double lastValidMppiCommand = 0.0;
+    /* Tracks MPPI's own last DELTA (not the blended total) so the next
+       Update() call's controlChange cost measures how much the AVOIDANCE
+       contribution is changing, not the baseline's - see
+       doc/PROJECT_CONTEXT.md "separate road-following from obstacle
+       avoidance" task. */
+    static double previousMppiDelta = 0.0;
     static unsigned int logCounter = 0;
 
     /* Rely on the Vehicle Operator within DrivMan module to get
@@ -999,6 +1064,7 @@ User_DrivMan_Calc(double dt)
         mppiValid = false;
         hasLastValidMppiCommand = false;
         lastValidMppiCommand = 0.0;
+        previousMppiDelta = 0.0;
         mppiController.Reset();
         logCounter = 0;
         User.Out[0] = 0.0;
@@ -1013,6 +1079,14 @@ User_DrivMan_Calc(double dt)
         User.Out[9] = NearestObstacleDy();
         return 0;
     }
+
+    /* IPGDriver's own road-following steering for this cycle, computed by
+       the core DrivMan_Calc() that already ran before we get here - this
+       is what carries the vehicle through a curve; MPPI below only adds a
+       small avoidance delta on top (see doc/PROJECT_CONTEXT.md "separate
+       road-following from obstacle avoidance" task). Captured before
+       anything below overwrites DrivMan.Steering. */
+    const double ipgBaselineSteering = DrivMan.Steering.Ang;
 
     constexpr double FallbackLateralGain = 0.12;
     constexpr double FallbackHeadingGain = 1.5;
@@ -1057,14 +1131,22 @@ User_DrivMan_Calc(double dt)
         if (mppiUpdateTimer >= MppiUpdatePeriod) {
             const MppiResult result = mppiController.Update(
                 distanceFromControlStart, Vehicle.Road.Path.tRoad,
-                headingRelativeToRoad, vehicleSpeed, steeringCommand);
+                headingRelativeToRoad, vehicleSpeed, previousMppiDelta, ipgBaselineSteering);
             mppiUpdateTimer = fmod(mppiUpdateTimer, MppiUpdatePeriod);
             mppiBestCost = result.BestCost;
             mppiValid = result.Valid;
-            mppiRequestedSteering = result.Valid ? result.Command : fallbackSteering;
+            /* result.Command is MPPI's avoidance DELTA only; the executed
+               command adds it to IPGDriver's own road-following baseline
+               (see doc/PROJECT_CONTEXT.md "separate road-following from
+               obstacle avoidance" task). fallbackSteering stays an
+               absolute safety-net value, unchanged, for when MPPI itself
+               is invalid. */
+            mppiRequestedSteering = result.Valid
+                ? ipgBaselineSteering + result.Command : fallbackSteering;
             if (result.Valid) {
                 hasLastValidMppiCommand = true;
                 lastValidMppiCommand = result.Command;
+                previousMppiDelta = result.Command;
             }
         }
         controllerMode = mppiValid ? ControllerMode::Mppi : ControllerMode::Fallback;
@@ -1128,12 +1210,17 @@ User_DrivMan_Calc(double dt)
 
         const int nearestObjectId = SensorObstacleCount > 0
             ? SensorObstacles[0].objId : -1;
+        const double currentRoadCurvature =
+            RoadCurvature(distanceFromControlStart, Vehicle.Road.Path.tRoad);
         Log("Steering control: speedState=%s obstacleCount=%d nearest dx=%.1f m "
-            "dy=%.3f m id=%d ids=%s command=%.2f deg cost=%.2f mode=%s\n",
+            "dy=%.3f m id=%d ids=%s command=%.2f deg cost=%.2f mode=%s "
+            "tRoad=%.3f m curvature=%.5f 1/m baseline=%.2f deg delta=%.2f deg\n",
             SpeedStateName(speedState), SensorObstacleCount,
             NearestObstacleDx(), NearestObstacleDy(), nearestObjectId, obstacleIds,
             steeringCommand * 180.0 / Pi, mppiBestCost,
-            ControllerModeName(controllerMode));
+            ControllerModeName(controllerMode),
+            Vehicle.Road.Path.tRoad, currentRoadCurvature,
+            ipgBaselineSteering * 180.0 / Pi, previousMppiDelta * 180.0 / Pi);
     }
 
     return 0;
@@ -1160,7 +1247,7 @@ User_VehicleControl_Calc(double dt)
     static bool first = true;
 
     if (first) {
-        Log("BUILD STAMP: CURVATURE_SIGN_REVERT_V5 (built %s %s)\n", __DATE__, __TIME__);
+        Log("BUILD STAMP: MPPI_TOGGLE_V11 (built %s %s)\n", __DATE__, __TIME__);
         Log("User_VehicleControl_Calc() is running!");
         first = false;
     }
