@@ -1,6 +1,6 @@
 /*
  *****************************************************************************
- *  CarMaker - Version 15.0
+ *  CarMaker - Version 14.1
  *  Virtual Test Driving Tool
  *
  *  Copyright ©1998-2025 IPG Automotive GmbH. All rights reserved.
@@ -16,7 +16,7 @@
  *	User_PrintUsage ()
  *	User_ScanCmdLine ()
  *
- *	User_AppLogFilter ()
+ *	User_AppLogFilter ()3
  *
  *	User_Init ()
  *	User_Register ()
@@ -99,6 +99,10 @@
 /* @@PLUGIN-BEGIN-INCLUDE@@ - Automatically generated code - don't edit! */
 /* @@PLUGIN-END@@ */
 
+# if defined(T3R_IF)
+    # include "LIB_T3R_IF/T3R_IF.h"
+# endif
+
 int UserCalcCalledByAppTestRunCalc = 0;
 
 tUser User;
@@ -109,58 +113,13 @@ constexpr double Pi = 3.14159265358979323846;
 
 /* Object Sensor obstacle cost envelope. */
 constexpr double ObstacleLongitudinalRadius = 25.0;       /* avoidance envelope [m] */
-constexpr double ObstacleLateralRadius = 1.85;             /* avoidance envelope [m] */
+constexpr double ObstacleLateralRadius = 1.75;             /* avoidance envelope [m] */
 constexpr double PreferredPassingLateralPosition = 2.25;  /* deterministic left pass [m] */
-constexpr double RoadSafetyMargin = 1.0;                  /* edge approach margin [m] */
+constexpr double RoadSafetyMargin = 0.5;                  /* edge approach margin [m] */
 constexpr double DefaultRoadWidth = 6.0;                  /* conservative eval fallback [m] */
-/* Weights for RoadBoundaryCost() below (see doc/PROJECT_CONTEXT.md "road
-   edge not punished enough" task). Old values (soft=500, hard=5000) were
-   smaller than ObstacleCost()'s own max penetration cost (~10,250), so the
-   optimizer wasn't actually deterred from grazing/lightly crossing the
-   edge if doing so helped dodge something obstacle-related - the two
-   costs were the wrong relative scale. RoadEdgeHardPenalty is deliberately
-   enormous (same "effectively forbidden" pattern used elsewhere for
-   collisions): scaledCost = (cost-min)/MppiTemperature will be far past
-   the existing `scaledCost < 60` weight-survival cutoff, so any sample
-   that actually crosses the edge gets exactly zero softmax weight
-   whenever an on-road sample exists, regardless of what it saved on
-   obstacle cost. */
-constexpr double RoadEdgeSoftPenaltyWeight = 3000.0;
-constexpr double RoadEdgeHardPenaltyWeight = 1.0e6;
-/* FIX ("the right white line should be treated like a railing" task): the
-   right edge of the current lane is the actual paved-road edge (grass/
-   shoulder beyond it) - there is nothing recoverable past it, unlike the
-   left edge, which in these scenarios is the boundary into the passing
-   lane (crossing it briefly to get around a slower car is normal, intended
-   behavior - see PreferredPassingLateralPosition). So the right side needs
-   a categorically bigger deterrent than the left, not just the same "very
-   large" cost: ~1000x the left hard weight, so that even in a genuine
-   dilemma (car very close on one side, edge close on the other) the
-   optimizer always prefers tightening up next to the car over crossing
-   the right line. */
-constexpr double RightRoadEdgeSoftPenaltyWeight = 30000.0;
-constexpr double RightRoadEdgeHardPenaltyWeight = 1.0e9;
 
 tRoadEval *MppiRoadEval = nullptr;
 double RoadEvaluationSOffset = 0.0;
-/* Current lane's own half-width (right limit) and half-width plus the
-   adjacent lane's width if one exists (left limit), snapshotted once per
-   outer cycle from Vehicle.Road.Act/OnLeft (see RoadBoundaryCost()
-   and the edge guardrail below - "where is the right boundary" task).
-   Deliberately NOT re-derived via RoadRouteEval() per rollout step: that
-   API's width[] output is relative to the ROUTE's center line, but
-   Vehicle.Road.Path.tRoad (and everything derived from it in the rollout)
-   is relative to the PATH's/lane's own center - two different origins,
-   offset by roughly half a lane width. Comparing a Route-relative border
-   against a Path-relative position was the root cause of the guardrail
-   firing at the wrong distance (~1.9 m instead of the lane's actual 2.75 m
-   edge). Vehicle.Road.Act.Width/OnLeft.Width are already in the same
-   Path-relative frame as tRoad, so no conversion is needed; the tradeoff is
-   that they're a snapshot of the CURRENT position, held constant across
-   the ~3-4 s rollout horizon rather than re-evaluated ahead - acceptable
-   for these mostly-uniform road sections. */
-double CurrentRightRoadLimit = 0.5 * DefaultRoadWidth;
-double CurrentLeftRoadLimit = 0.5 * DefaultRoadWidth;
 
 struct Obstacle {
     bool valid;
@@ -175,12 +134,6 @@ std::array<Obstacle, MaxObstacles> SensorObstacles{};
 int SensorObstacleCount = 0;
 double SensorObstacleReferenceRoadDistance = 0.0;
 double SensorObstacleReferenceLateralPosition = 0.0;
-/* Ego heading-relative-to-road at the moment the two references above were
-   captured (see ObstacleCost() below - "wrong side swerve" fix). Needed to
-   rotate obstacle.dx/dy, which are in the vehicle's own heading-aligned
-   SENSOR frame, into the road-aligned frame before combining them with
-   road-frame reference values. */
-double SensorObstacleReferenceHeading = 0.0;
 
 double
 NearestObstacleDx()
@@ -198,28 +151,6 @@ constexpr double SteeringLimit = 15.0 * Pi / 180.0;      /* steering-wheel angle
 constexpr double SteeringRateLimit = 30.0 * Pi / 180.0;  /* [rad/s] */
 constexpr double SteeringAccelerationLimit = 2.0;        /* [rad/s^2] */
 constexpr double RecoverySteeringLimit = 5.0 * Pi / 180.0; /* gentle stalled recovery [rad] */
-/* Defensive backstop only (see doc/PROJECT_CONTEXT.md "steering runaway
-   while stalled" task): now that the executed command is baseline +
-   correction rather than a value MPPI/fallback bounds by construction, add
-   an explicit absolute ceiling so any unforeseen feedback path (the
-   stalled-baseline fix above addresses the one found) can't drive the
-   physical command to an absurd angle. Generous - about 2 full turns each
-   way, well beyond any normal steering-wheel command this project issues. */
-constexpr double MaxAbsoluteSteeringCommand = 720.0 * Pi / 180.0;
-
-/* Hard edge guardrail (see User_DrivMan_Calc() below - "just don't want it
-   to go over the edge" ask). RoadBoundaryCost() only makes crossing the
-   edge EXPENSIVE, it doesn't make it impossible: it's one term in a
-   weighted-average cost, so if literally no sampled maneuver this cycle
-   both stays on the road and clears an obstacle, MPPI still returns
-   whichever sample was least bad, which can itself be off-road. This is a
-   deterministic backstop on the vehicle's ACTUAL current position (not a
-   rollout guess): the instant tRoad gets within this margin of the real
-   road edge, it overrides MPPI/baseline entirely and steers hard back
-   toward center, no cost function involved, so it can't be outweighed by
-   any obstacle. It's meant to almost never fire if the cost-based tuning
-   above is doing its job - it's the guarantee underneath the preference. */
-constexpr double RoadEdgeGuardrailMargin = 0.15; /* [m] trigger just inside the true edge */
 
 enum class SpeedState {
     Startup,
@@ -230,9 +161,7 @@ enum class SpeedState {
 enum class ControllerMode {
     Fallback,
     Mppi,
-    Recovery,
-    Passthrough,  /* moving, no collision risk sensed: IPGDriver baseline only */
-    EdgeGuardrail /* hard override: actual position too close to the road edge */
+    Recovery
 };
 
 char const *
@@ -256,10 +185,6 @@ ControllerModeName(ControllerMode mode)
         return "MPPI";
     case ControllerMode::Recovery:
         return "RECOVERY";
-    case ControllerMode::Passthrough:
-        return "PASSTHROUGH";
-    case ControllerMode::EdgeGuardrail:
-        return "EDGE_GUARDRAIL";
     default:
         return "FALLBACK";
     }
@@ -274,30 +199,6 @@ constexpr double MppiNoiseStd = 4.0 * Pi / 180.0;
 constexpr double MppiNoiseCorrelation = 0.70;
 constexpr double MppiWheelbase = 2.8;                    /* bicycle-model wheelbase [m] */
 constexpr double MppiSteeringRatio = 16.0;               /* steering wheel / road wheel */
-
-/* Reduced, not zeroed (see doc/PROJECT_CONTEXT.md "separate road-following
-   from obstacle avoidance" task): lane-centering is primarily IPGDriver's
-   baseline's job now (added back in via SteeringMppi::Update()'s
-   baselineSteering parameter), so this is far below the original 4.0/12.0
-   to avoid MPPI's delta double-fighting a baseline that's already doing
-   the job. But fully zeroing it (tried first) left MPPI's delta with NO
-   restoring pull at all - if the baseline ever settles away from tRoad=0
-   (observed: ~2 m sustained offset on the circle track, cause unconfirmed,
-   possibly a lane-offset setting or a leftover avoidance maneuver), nothing
-   corrected it, and it compounded into a road departure once an obstacle's
-   avoidance delta pushed the same direction as the existing drift. This
-   keeps a small non-zero pull so a persistent baseline offset gets slowly
-   corrected instead of accumulating indefinitely. */
-constexpr double LaneCenterWeight = 1.0;
-constexpr double TerminalLaneCenterWeight = 3.0;
-
-/* DEBUG toggle: set to false to disable MPPI (and the fallback/recovery
-   steering paths) entirely and run with IPGDriver's own baseline steering
-   only, completely untouched - useful for seeing how the vehicle handles
-   the track/route with no additional control layered on top at all.
-   Compile-time, like BestFeasibleRolloutMode-style toggles elsewhere in
-   this file: flip and rebuild. */
-constexpr bool MppiEnabled = true;
 
 double
 Clamp(double value, double lower, double upper)
@@ -317,128 +218,6 @@ WrapAngle(double angle)
     return angle;
 }
 
-/* FIX ("avoidance commits too late / fades out right when it's needed most"
-   task): this used to be 3.0 s, deliberately set equal to
-   MppiHorizon*MppiStep (also 3.0 s). That means the obstacle only entered
-   AnyCollisionRiskSensed()'s trigger at the exact moment it was also just
-   crossing INTO the edge of MPPI's own planning horizon - so at the instant
-   avoidance first engages, the rollout can barely "see" the obstacle at
-   all, let alone plan a gradual, early lateral shift around it. Observed on
-   the expressway log: avoidance delta was already near max at first
-   trigger (13.5 deg) but tRoad had barely moved yet, then the delta faded
-   (8.5 deg, then 1.2 deg) as the car closed in - not because the danger was
-   decreasing, but because by then the maneuver was mostly already "spent"
-   inside a horizon that had no slack left over. Triggering 1+ second before
-   the obstacle would even enter the horizon gives MPPI room to plan the
-   whole maneuver as a smooth curve from the start, instead of committing
-   hard right as the object appears and then running out of horizon to
-   finish the job. */
-constexpr double CollisionRiskTimeToCollision = 4.0;
-
-/* "Senses collision" gate (see doc/PROJECT_CONTEXT.md "only override on
-   sensed collision" / "detection too late at high speed" tasks). Two
-   checks, either one triggers:
-   1. ANY currently-detected object's raw, un-projected sensor reading
-      (dx, dy) falls inside the same normalized avoidance envelope
-      ObstacleCost() itself treats as its "penetration zone"
-      (normalizedDistanceSquared < 1.0) - a fixed geometric danger zone,
-      correct at any speed.
-   2. Speed-aware: time-to-collision (dx / speed) is under
-      CollisionRiskTimeToCollision. A FIXED distance alone gives less and
-      less warning time as speed increases - at 25 m and 10 m/s that's
-      2.5 s of warning, but at 40 m/s it's under 0.6 s ("swerving too
-      late"). This makes the trigger distance grow with speed instead of
-      staying fixed.
-      NOTE: deliberately no lateral gate on this branch (tried one first,
-      `|dy| < obstacle.radius`, and removed it - see doc/PROJECT_CONTEXT.md
-      "circle path avoidance failure" task). On a curving road, obstacle.dy
-      is the RAW sensor-frame offset, which stays large right up until the
-      vehicle's heading actually swings to face the object - observed on
-      the circle track: dy=9.3 m, then 2.5 m, both still "off to the side"
-      by that gate, and it only triggered at dx=2.5 m (already almost on
-      top of it). Triggering on time-to-collision alone, regardless of
-      current dy, means MPPI also runs for some genuinely-irrelevant
-      off-to-the-side objects, but its own ObstacleCost() already discounts
-      those to near-zero once it runs (confirmed on the expressway
-      scenario: dy=75-94 m objects produced ~0 delta even while engaged) -
-      the extra rollout compute is a smaller cost than missing a real
-      curve-ahead threat. */
-bool
-AnyCollisionRiskSensed(double speed)
-{
-    for (int i = 0; i < SensorObstacleCount; ++i) {
-        const Obstacle &obstacle = SensorObstacles[i];
-        if (!obstacle.valid) {
-            continue;
-        }
-        const double longitudinalSeparation = obstacle.dx / ObstacleLongitudinalRadius;
-        const double lateralSeparation = obstacle.dy / obstacle.radius;
-        const double normalizedDistanceSquared =
-            longitudinalSeparation * longitudinalSeparation
-            + lateralSeparation * lateralSeparation;
-        if (normalizedDistanceSquared < 1.0) {
-            return true;
-        }
-        if (speed > 0.1 && obstacle.dx > 0.0
-            && obstacle.dx / speed < CollisionRiskTimeToCollision) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/* How close back to lane-center counts as "reconverged" - see
-   NeedsMppiEngagement() below. */
-constexpr double MppiReconvergenceLateralTolerance = 0.3; /* [m] */
-
-/* (see doc/PROJECT_CONTEXT.md "can't return to a curving route after
-   avoiding an obstacle" task). Previously MPPI engaged ONLY on sensed
-   collision risk; once the risk cleared, steering dropped straight to
-   PASSTHROUGH (baseline alone), so any lateral offset left over from the
-   avoidance swerve was entirely IPGDriver's own baseline's problem to fix.
-   On a straight road that's fine; on a curve, the baseline is
-   simultaneously tracking the ongoing curve AND trying to claw back a
-   real lateral error it wasn't necessarily designed to recover from
-   aggressively, and can lose that race - leaving the car parked at an
-   offset. Keeping MPPI engaged (with its own modest LaneCenterWeight pull,
-   now also curvature-aware) until the car is actually back near center,
-   not just until the collision risk clears, lets it help close that gap
-   instead of handing 100% of recovery to the baseline. */
-bool
-NeedsMppiEngagement(double speed, double lateralPosition)
-{
-    if (AnyCollisionRiskSensed(speed)) {
-        return true;
-    }
-    return fabs(lateralPosition) > MppiReconvergenceLateralTolerance;
-}
-
-/* FIX ("wrong side swerve" task): obstacle.dx/dy are in the vehicle's own
-   heading-aligned SENSOR frame (Object Sensor NearPnt.ds), not the road
-   frame - they must be rotated by the ego's heading-relative-to-road at
-   capture time (SensorObstacleReferenceHeading) before being added onto the
-   road-frame reference position. Previously this was a plain, un-rotated
-   add, which is only correct when the vehicle points exactly down the road
-   tangent; any heading offset (mid avoidance maneuver, or just a curve)
-   shifted the obstacle's computed road-frame position, sometimes making the
-   real gap look like it was on the wrong side. Factored out of
-   ObstacleCost() so the diagnostic log below can report the same resolved
-   position MPPI actually reasons about, instead of only the raw sensor
-   dx/dy - needed to settle "why did it swerve toward that side" questions
-   from the log alone instead of guessing. */
-void
-ObstacleAbsolutePosition(const Obstacle &obstacle, double &roadPosition, double &lateralPosition)
-{
-    const double cosReferenceHeading = cos(SensorObstacleReferenceHeading);
-    const double sinReferenceHeading = sin(SensorObstacleReferenceHeading);
-    const double obstacleRoadOffset =
-        obstacle.dx * cosReferenceHeading - obstacle.dy * sinReferenceHeading;
-    const double obstacleLateralOffset =
-        obstacle.dx * sinReferenceHeading + obstacle.dy * cosReferenceHeading;
-    roadPosition = SensorObstacleReferenceRoadDistance + obstacleRoadOffset;
-    lateralPosition = SensorObstacleReferenceLateralPosition + obstacleLateralOffset;
-}
-
 double
 ObstacleCost(double roadDistance, double lateralPosition)
 {
@@ -450,9 +229,10 @@ ObstacleCost(double roadDistance, double lateralPosition)
             continue;
         }
 
-        double obstacleRoadDistance;
-        double obstacleLateralPosition;
-        ObstacleAbsolutePosition(obstacle, obstacleRoadDistance, obstacleLateralPosition);
+        const double obstacleRoadDistance =
+            SensorObstacleReferenceRoadDistance + obstacle.dx;
+        const double obstacleLateralPosition =
+            SensorObstacleReferenceLateralPosition + obstacle.dy;
         const double longitudinalSeparation =
             (roadDistance - obstacleRoadDistance) / ObstacleLongitudinalRadius;
         const double lateralSeparation =
@@ -462,54 +242,57 @@ ObstacleCost(double roadDistance, double lateralPosition)
             + lateralSeparation * lateralSeparation;
 
         double cost = 250.0 * exp(-0.5 * normalizedDistanceSquared);
-        /* FIX: passingGate previously only depended on longitudinal
-           distance, so the "prefer to pass on the left" pull toward
-           PreferredPassingLateralPosition activated for ANY object within
-           ObstacleLongitudinalRadius, even ones tens of meters off to the
-           side (e.g. dy=30 m) that pose no real collision risk - causing
-           unwanted lane drift whenever such an object happened to be
-           nearby in distance. lateralGate (reusing the same
-           lateralSeparation already computed above, so no extra cost)
-           makes the passing preference fade out for objects that aren't
-           actually near the vehicle's path, the same envelope the
-           collision cost itself already uses. */
         const double passingGate = exp(-0.5 * longitudinalSeparation * longitudinalSeparation);
-        const double lateralGate = exp(-0.5 * lateralSeparation * lateralSeparation);
         const double passingError = lateralPosition - PreferredPassingLateralPosition;
-        cost += 3.0 * passingGate * lateralGate * passingError * passingError;
+        cost += 3.0 * passingGate * passingError * passingError;
         if (normalizedDistanceSquared < 1.0) {
             const double penetration = 1.0 - normalizedDistanceSquared;
             cost += 2000.0 + 8000.0 * penetration * penetration;
         }
         totalCost += cost;
     }
-
+    //if (logCounter++ % 1000 == 0) {
+    //    Log("ObstacleCost: %.2f\n", totalCost)
+    //}
     return totalCost;
 }
 
-/* roadDistance is intentionally unused: CurrentLeftRoadLimit/
-   CurrentRightRoadLimit are a per-cycle snapshot (see above), not a
-   function of the predicted rollout position - kept as a parameter so the
-   call sites (which iterate over predictedDistance/predictedLateralPosition
-   pairs) don't need special-casing. */
 double
-RoadBoundaryCost(double /* roadDistance */, double lateralPosition)
+RoadBoundaryCost(double roadDistance, double lateralPosition)
 {
-    const bool isRight = lateralPosition < 0.0;
-    const double hardLimit = isRight ? CurrentRightRoadLimit : CurrentLeftRoadLimit;
-    const double softLimit = fmax(0.0, hardLimit - RoadSafetyMargin);
-    const double softWeight = isRight ? RightRoadEdgeSoftPenaltyWeight : RoadEdgeSoftPenaltyWeight;
-    const double hardWeight = isRight ? RightRoadEdgeHardPenaltyWeight : RoadEdgeHardPenaltyWeight;
+    double roadWidth = DefaultRoadWidth;
+    if (MppiRoadEval != nullptr) {
+        tRoadRouteIn rIn{};
+        tRoadRouteOut rOut{};
+        rIn.st[0] = RoadEvaluationSOffset + roadDistance;
+        rIn.st[1] = lateralPosition;
+
+        if (RoadRouteEval(MppiRoadEval, nullptr, RIT_ST, &rIn, &rOut) == ROAD_Ok
+            && std::isfinite(rOut.width[0]) && rOut.width[0] > 0.0
+            && std::isfinite(rOut.width[1]) && rOut.width[1] > 0.0) {
+            const double evaluatedRoadWidth = rOut.width[0] + rOut.width[1];
+            if (std::isfinite(evaluatedRoadWidth) && evaluatedRoadWidth > 0.0) {
+                roadWidth = evaluatedRoadWidth;
+            }
+        }
+    }
+
+    const double halfRoadWidth = 0.5 * roadWidth;
+    const double softLimit = fmax(0.0, halfRoadWidth - RoadSafetyMargin);
+    const double hardLimit = halfRoadWidth;
     const double absoluteLateralPosition = fabs(lateralPosition);
     double cost = 0.0;
     if (absoluteLateralPosition > softLimit) {
         const double excess = absoluteLateralPosition - softLimit;
-        cost += softWeight * excess * excess;
+        cost += 500.0 * excess * excess;
     }
     if (absoluteLateralPosition > hardLimit) {
         const double excess = absoluteLateralPosition - hardLimit;
-        cost += hardWeight * (1.0 + excess * excess);
+        cost += 6000.0 * (1.0 + excess * excess);
     }
+    //if (logCounter++ % 1000 == 0) {
+    //    Log("RoadBoundaryCost: %.2f\n", cost)
+    //}
     return cost;
 }
 
@@ -568,21 +351,9 @@ public:
         NormalDistribution.reset();
     }
 
-    /* baselineSteering: IPGDriver's own steering-wheel command for this
-       cycle (see doc/PROJECT_CONTEXT.md "separate road-following from
-       obstacle avoidance" task). MPPI no longer tries to track lane-center
-       on its own (LaneCenterWeight below is 0) - that's IPGDriver's job,
-       with its own steering authority, unrestricted by SteeringLimit.
-       MPPI's sampled `steering` is now purely an avoidance DELTA, added to
-       baselineSteering both in the rollout's kinematics (held constant
-       across the horizon - a fair approximation on a constant-or-slowly-
-       varying-radius curve) and in the executed command (see
-       User_DrivMan_Calc). This is why a tight curve that exceeds
-       SteeringLimit on its own can still be followed: the baseline
-       supplies the large turn, MPPI only adds a small avoidance nudge. */
     MppiResult Update(double roadDistance, double lateralPosition,
                       double headingRelativeToRoad, double speed,
-                      double previousAppliedSteering, double baselineSteering)
+                      double previousAppliedSteering)
     {
         double minimumCost = std::numeric_limits<double>::infinity();
         const double correlationScale = sqrt(1.0 - MppiNoiseCorrelation * MppiNoiseCorrelation);
@@ -609,7 +380,7 @@ public:
                 Noise[sample][step] = noise;
                 previousNoise = noise;
 
-                const double frontWheelAngle = (baselineSteering + steering) / MppiSteeringRatio;
+                const double frontWheelAngle = steering / MppiSteeringRatio;
                 const double roadCurvature = RoadCurvature(predictedDistance, predictedLateralPosition);
                 const double stepDistance = speed * cos(predictedHeading) * MppiStep;
                 predictedDistance += stepDistance;
@@ -623,7 +394,7 @@ public:
                 const double controlChange = steering - previousControl;
 
                 const double runningCost =
-                    LaneCenterWeight * lateralError * lateralError
+                    4.0 * lateralError * lateralError
                     + 60.0 * headingError * headingError
                     + 0.2 * steering * steering
                     + 0.5 * controlChange * controlChange
@@ -637,7 +408,7 @@ public:
 
             const double terminalLateralError = -predictedLateralPosition;
             const double terminalHeadingError = WrapAngle(-predictedHeading);
-            cost += TerminalLaneCenterWeight * terminalLateralError * terminalLateralError
+            cost += 12.0 * terminalLateralError * terminalLateralError
                 + 100.0 * terminalHeadingError * terminalHeadingError
                 + ObstacleCost(predictedDistance, predictedLateralPosition)
                 + RoadBoundaryCost(predictedDistance, predictedLateralPosition);
@@ -783,6 +554,7 @@ int
 User_Init_First(void)
 {
     memset(&User, 0, sizeof(User));
+    Log("1");
 
     return 0;
 }
@@ -867,6 +639,10 @@ int
 User_Init(void)
 {
     printf("My code is running!\n");
+    Log("My code is running!");
+# if defined(T3R_IF)
+    T3R_IF_Init();
+# endif
     return 0;
 }
 
@@ -900,6 +676,9 @@ User_DeclQuants(void)
         sprintf(sbuf, "UserOut_%02d", i);
         DDefDouble(NULL, sbuf, "", &User.Out[i], DVA_IO_Out);
     }
+# if defined(T3R_IF)
+    T3R_IF_DeclQuants();
+# endif
 }
 
 /*
@@ -977,6 +756,9 @@ User_Param_Get(void)
     if (SimCore.TestRig.SimParam.Inf == NULL) {
         return -4;
     }
+# if defined(T3R_IF)
+    rv = T3R_IF_Param_Get();
+# endif
 
     return rv;
 }
@@ -1007,6 +789,10 @@ User_TestRun_Start_atBegin(void)
     for (i = 0; i < N_USEROUTPUT; i++) {
         User.Out[i] = 0.0;
     }
+# if defined(T3R_IF)
+    if (T3R_IF_TestRun_Start_atBegin() < 0)
+        rv = -1;
+# endif
 
     if (IO_None) {
         return rv;
@@ -1048,7 +834,7 @@ User_TestRun_Start_atEnd(void)
     }
 
     MppiRoadEval = RoadNewRoadEval(
-        Env.Road, ROAD_BUMP_NONE, ROAD_OT_WIDTH | ROAD_OT_LANES | ROAD_OT_CURVE_XY, "User.MPPI");
+        Env.Road, ROAD_BUMP_NONE, ROAD_OT_WIDTH | ROAD_OT_LANES, "User.MPPI");
     if (MppiRoadEval == nullptr
         || RoadEvalSetRouteByObjId(MppiRoadEval, Env.Route.ObjId, 1) != ROAD_Ok) {
         LogWarnF(EC_Init,
@@ -1067,9 +853,6 @@ User_TestRun_Start_atEnd(void)
     SensorObstacleCount = 0;
     SensorObstacleReferenceRoadDistance = 0.0;
     SensorObstacleReferenceLateralPosition = 0.0;
-    SensorObstacleReferenceHeading = 0.0;
-    CurrentRightRoadLimit = 0.5 * DefaultRoadWidth;
-    CurrentLeftRoadLimit = 0.5 * DefaultRoadWidth;
 
     if (MountedObjectSensor == nullptr) {
         LogWarnF(EC_Init, "Object sensor '%s' was not found; continuing without sensor obstacle",
@@ -1130,6 +913,9 @@ int
 User_TestRun_RampUp(double dt)
 {
     int IsReady = 1;
+# if defined(T3R_IF)
+    IsReady = T3R_IF_RampUp();
+# endif
 
     return IsReady;
 }
@@ -1191,6 +977,9 @@ User_TestRun_End(void)
 void
 User_In(unsigned const CycleNo)
 {
+# if defined(T3R_IF)
+    T3R_IF_In();
+# endif
     if (SimCore.State != SCState_Simulate) {
         return;
     }
@@ -1211,19 +1000,8 @@ User_DrivMan_Calc(double dt)
     static bool firstDrivMan = true;
     if (firstDrivMan) {
         Log("User_DrivMan_Calc() is running!\n");
-        Log(MppiEnabled
-            ? "MPPI steering: ENABLED\n"
-            : "MPPI steering: DISABLED - running IPGDriver baseline steering untouched\n");
         firstDrivMan = false;
     }
-
-    if (!MppiEnabled) {
-        /* Leave DrivMan.Steering exactly as the core DrivMan_Calc() (which
-           already ran this cycle) computed it - no MPPI, no fallback, no
-           recovery, no obstacle avoidance. Pure baseline route-following. */
-        return 0;
-    }
-
     static SteeringMppi mppiController;
     static double controlStartRoadPosition = 0.0;
     static bool controlReferenceInitialized = false;
@@ -1235,27 +1013,6 @@ User_DrivMan_Calc(double dt)
     static bool mppiValid = false;
     static bool hasLastValidMppiCommand = false;
     static double lastValidMppiCommand = 0.0;
-    /* Tracks MPPI's own last DELTA (not the blended total) so the next
-       Update() call's controlChange cost measures how much the AVOIDANCE
-       contribution is changing, not the baseline's - see
-       doc/PROJECT_CONTEXT.md "separate road-following from obstacle
-       avoidance" task. */
-    static double previousMppiDelta = 0.0;
-    /* FIX (see doc/PROJECT_CONTEXT.md "steering runaway while stalled"
-       task): ipgBaselineSteering is read from DrivMan.Steering.Ang at the
-       TOP of this function, but WE write DrivMan.Steering.Ang =
-       steeringCommand at the BOTTOM of the previous cycle - so it is not
-       an independent signal once RECOVERY mode has run even once, it's
-       partly our own prior output. RECOVERY previously did
-       `ipgBaselineSteering + Clamp(lastValidMppiCommand, +-RecoverySteeringLimit)`
-       EVERY cycle, using a freshly re-read (self-referential) baseline
-       each time; since lastValidMppiCommand stays fixed and nonzero while
-       stalled, this is a literal discrete integrator with no ceiling -
-       observed climbing past 600 degrees over a ~30s stall. Snapshotting
-       the baseline ONCE when a stall begins and holding that fixed value
-       breaks the feedback loop entirely. */
-    static bool stalledBaselineCaptured = false;
-    static double stalledBaselineSteering = 0.0;
     static unsigned int logCounter = 0;
 
     /* Rely on the Vehicle Operator within DrivMan module to get
@@ -1272,9 +1029,6 @@ User_DrivMan_Calc(double dt)
         mppiValid = false;
         hasLastValidMppiCommand = false;
         lastValidMppiCommand = 0.0;
-        previousMppiDelta = 0.0;
-        stalledBaselineCaptured = false;
-        stalledBaselineSteering = 0.0;
         mppiController.Reset();
         logCounter = 0;
         User.Out[0] = 0.0;
@@ -1290,13 +1044,8 @@ User_DrivMan_Calc(double dt)
         return 0;
     }
 
-    /* IPGDriver's own road-following steering for this cycle, computed by
-       the core DrivMan_Calc() that already ran before we get here - this
-       is what carries the vehicle through a curve; MPPI below only adds a
-       small avoidance delta on top (see doc/PROJECT_CONTEXT.md "separate
-       road-following from obstacle avoidance" task). Captured before
-       anything below overwrites DrivMan.Steering. */
-    const double ipgBaselineSteering = DrivMan.Steering.Ang;
+    constexpr double FallbackLateralGain = 0.12;
+    constexpr double FallbackHeadingGain = 1.5;
 
     if (dt <= 0.0 || Vehicle.Road.offRoute) {
         return 0;
@@ -1325,128 +1074,47 @@ User_DrivMan_Calc(double dt)
     constexpr double desiredHeadingRelativeToRoad = 0.0;
     const double roadHeading = atan2(Vehicle.Road.Path.X_0[1], Vehicle.Road.Path.X_0[0]);
     const double headingRelativeToRoad = WrapAngle(Vehicle.Yaw - roadHeading);
-    SensorObstacleReferenceHeading = headingRelativeToRoad;
     const double headingError = WrapAngle(
         desiredHeadingRelativeToRoad - headingRelativeToRoad);
 
     const double lateralError = desiredLateralPosition - Vehicle.Road.Path.tRoad;
-
-    /* Snapshot this cycle's lane-relative road limits - see
-       CurrentRightRoadLimit/CurrentLeftRoadLimit above for why this reads
-       Vehicle.Road.Act/OnLeft (Path-relative, matching tRoad's own
-       frame) instead of RoadRouteEval (Route-relative). */
-    {
-        const double actWidth = std::isfinite(Vehicle.Road.Act.Width)
-                && Vehicle.Road.Act.Width > 0.0
-            ? Vehicle.Road.Act.Width : DefaultRoadWidth;
-        const double leftLaneWidth = std::isfinite(Vehicle.Road.OnLeft.Width)
-                && Vehicle.Road.OnLeft.Width > 0.0
-            ? Vehicle.Road.OnLeft.Width : 0.0;
-        CurrentRightRoadLimit = 0.5 * actWidth;
-        CurrentLeftRoadLimit = 0.5 * actWidth + leftLaneWidth;
-    }
+    const double fallbackSteering = Clamp(
+        FallbackLateralGain * lateralError + FallbackHeadingGain * headingError,
+        -SteeringLimit, SteeringLimit);
 
     if (speedState == SpeedState::Moving) {
-        /* Only let MPPI touch the steering at all if it actually senses a
-           collision risk OR the car hasn't reconverged to lane-center yet
-           (see doc/PROJECT_CONTEXT.md "only override on sensed collision" /
-           "can't return to a curving route" tasks) - otherwise IPGDriver's
-           own baseline passes straight through, untouched, and MPPI
-           doesn't even run (saves the 256x60 rollout too). */
-        if (NeedsMppiEngagement(vehicleSpeed, Vehicle.Road.Path.tRoad)) {
-            mppiUpdateTimer += dt;
-            if (mppiUpdateTimer >= MppiUpdatePeriod) {
-                const MppiResult result = mppiController.Update(
-                    distanceFromControlStart, Vehicle.Road.Path.tRoad,
-                    headingRelativeToRoad, vehicleSpeed, previousMppiDelta, ipgBaselineSteering);
-                mppiUpdateTimer = fmod(mppiUpdateTimer, MppiUpdatePeriod);
-                mppiBestCost = result.BestCost;
-                mppiValid = result.Valid;
-                /* result.Command is MPPI's avoidance DELTA only; the executed
-                   command adds it to IPGDriver's own road-following baseline
-                   (see doc/PROJECT_CONTEXT.md "separate road-following from
-                   obstacle avoidance" task). If MPPI itself is invalid, fall
-                   back to the baseline alone rather than a standalone
-                   absolute correction - see the RECOVERY/FALLBACK fix below
-                   for why (dropping the baseline entirely caused the vehicle
-                   to leave a curving road). */
-                mppiRequestedSteering = result.Valid
-                    ? ipgBaselineSteering + result.Command : ipgBaselineSteering;
-                if (result.Valid) {
-                    hasLastValidMppiCommand = true;
-                    lastValidMppiCommand = result.Command;
-                    previousMppiDelta = result.Command;
-                }
+        mppiUpdateTimer += dt;
+        if (mppiUpdateTimer >= MppiUpdatePeriod) {
+            const MppiResult result = mppiController.Update(
+                distanceFromControlStart, Vehicle.Road.Path.tRoad,
+                headingRelativeToRoad, vehicleSpeed, steeringCommand);
+            mppiUpdateTimer = fmod(mppiUpdateTimer, MppiUpdatePeriod);
+            mppiBestCost = result.BestCost;
+            mppiValid = result.Valid;
+            mppiRequestedSteering = result.Valid ? result.Command : fallbackSteering;
+            if (result.Valid) {
+                hasLastValidMppiCommand = true;
+                lastValidMppiCommand = result.Command;
             }
-            controllerMode = mppiValid ? ControllerMode::Mppi : ControllerMode::Fallback;
-        } else {
-            mppiUpdateTimer = 0.0;
-            mppiValid = false;
-            mppiBestCost = 0.0;
-            previousMppiDelta = 0.0;
-            mppiRequestedSteering = ipgBaselineSteering;
-            controllerMode = ControllerMode::Passthrough;
         }
-        /* Not stalled right now: the next stall (if any) should snapshot a
-           fresh baseline, not reuse a stale one from a previous episode
-           (see doc/PROJECT_CONTEXT.md "steering runaway while stalled"
-           task). */
-        stalledBaselineCaptured = false;
+        controllerMode = mppiValid ? ControllerMode::Mppi : ControllerMode::Fallback;
     } else if (speedState == SpeedState::Stalled) {
-        /* FIX (see doc/PROJECT_CONTEXT.md "recovery went off a curving
-           road" / "steering runaway while stalled" tasks): this used to
-           add the recovery correction to a freshly re-read
-           ipgBaselineSteering EVERY cycle - but ipgBaselineSteering is
-           partly our own prior output (we write DrivMan.Steering.Ang each
-           cycle, then read it back next cycle), so with a fixed nonzero
-           lastValidMppiCommand this was a literal unbounded integrator
-           (observed: climbed past 600 degrees over a ~30s stall). Snapshot
-           the baseline ONCE when the stall begins and hold that fixed
-           value for the correction to sit on top of, instead of
-           re-reading a value that includes everything we've already added
-           on previous stalled cycles. */
         mppiValid = false;
-        if (!stalledBaselineCaptured) {
-            stalledBaselineSteering = ipgBaselineSteering;
-            stalledBaselineCaptured = true;
-        }
-        const double recoverySource = hasLastValidMppiCommand ? lastValidMppiCommand : 0.0;
-        mppiRequestedSteering = stalledBaselineSteering + Clamp(
+        const double recoverySource = hasLastValidMppiCommand
+            ? lastValidMppiCommand : fallbackSteering;
+        mppiRequestedSteering = Clamp(
             recoverySource, -RecoverySteeringLimit, RecoverySteeringLimit);
         controllerMode = ControllerMode::Recovery;
     } else {
-        /* STARTUP: no MPPI delta computed yet - baseline alone. */
         mppiValid = false;
-        mppiRequestedSteering = ipgBaselineSteering;
+        mppiRequestedSteering = fallbackSteering;
         controllerMode = ControllerMode::Fallback;
-    }
-
-    /* Hard edge guardrail - see RoadEdgeGuardrailMargin above. Deliberately
-       overrides mppiRequestedSteering itself (not steeringCommand
-       directly), so the existing rate/acceleration limiting below still
-       applies to it; this is a change of TARGET, not a bypass of the
-       actuator smoothing. Positive tRoad is left (see
-       PreferredPassingLateralPosition), and positive steering turns left,
-       so drifting past the left edge must steer right (negative) and vice
-       versa. */
-    {
-        const double leftGuardrailLimit = CurrentLeftRoadLimit - RoadEdgeGuardrailMargin;
-        const double rightGuardrailLimit = CurrentRightRoadLimit - RoadEdgeGuardrailMargin;
-        if (Vehicle.Road.Path.tRoad > leftGuardrailLimit) {
-            mppiRequestedSteering = -SteeringLimit;
-            controllerMode = ControllerMode::EdgeGuardrail;
-        } else if (Vehicle.Road.Path.tRoad < -rightGuardrailLimit) {
-            mppiRequestedSteering = SteeringLimit;
-            controllerMode = ControllerMode::EdgeGuardrail;
-        }
     }
 
     const double previousSteeringCommand = steeringCommand;
     const double maximumSteeringStep = SteeringRateLimit * dt;
     const double steeringError = mppiRequestedSteering - steeringCommand;
     steeringCommand += Clamp(steeringError, -maximumSteeringStep, maximumSteeringStep);
-    steeringCommand = Clamp(steeringCommand,
-        -MaxAbsoluteSteeringCommand, MaxAbsoluteSteeringCommand);
 
     const double steeringVelocity = (steeringCommand - previousSteeringCommand) / dt;
     double steeringAcceleration = (steeringVelocity - previousSteeringVelocity) / dt;
@@ -1467,32 +1135,19 @@ User_DrivMan_Calc(double dt)
     User.Out[5] = mppiRequestedSteering;
     User.Out[6] = mppiBestCost;
     User.Out[7] = controllerMode == ControllerMode::Mppi ? 1.0
-        : (controllerMode == ControllerMode::Recovery ? 2.0
-        : (controllerMode == ControllerMode::Passthrough ? 3.0
-        : (controllerMode == ControllerMode::EdgeGuardrail ? 4.0 : 0.0)));
+        : (controllerMode == ControllerMode::Recovery ? 2.0 : 0.0);
     User.Out[8] = NearestObstacleDx();
     User.Out[9] = NearestObstacleDy();
 
     if (logCounter++ % 1000 == 0) {
-        /* Reports EVERY tracked obstacle's resolved absolute road-frame
-           lateral position (id@lateralPosition), not just the nearest
-           one's raw sensor dx/dy - needed to answer "why did it swerve
-           toward that side" from the log directly (e.g. confirming whether
-           a second car is actually occupying the other side's gap) instead
-           of inferring it blind. */
-        char obstacleIds[160] = "none";
+        char obstacleIds[96] = "none";
         if (SensorObstacleCount > 0) {
             size_t offset = 0;
             obstacleIds[0] = '\0';
             for (int i = 0; i < SensorObstacleCount; ++i) {
-                double obstacleRoadPosition;
-                double obstacleLateralPosition;
-                ObstacleAbsolutePosition(
-                    SensorObstacles[i], obstacleRoadPosition, obstacleLateralPosition);
                 const int written = snprintf(
                     obstacleIds + offset, sizeof(obstacleIds) - offset,
-                    i == 0 ? "%d@%.2f" : ",%d@%.2f",
-                    SensorObstacles[i].objId, obstacleLateralPosition);
+                    i == 0 ? "%d" : ",%d", SensorObstacles[i].objId);
                 if (written < 0
                     || static_cast<size_t>(written) >= sizeof(obstacleIds) - offset) {
                     break;
@@ -1503,19 +1158,12 @@ User_DrivMan_Calc(double dt)
 
         const int nearestObjectId = SensorObstacleCount > 0
             ? SensorObstacles[0].objId : -1;
-        const double currentRoadCurvature =
-            RoadCurvature(distanceFromControlStart, Vehicle.Road.Path.tRoad);
         Log("Steering control: speedState=%s obstacleCount=%d nearest dx=%.1f m "
-            "dy=%.3f m id=%d ids=%s command=%.2f deg cost=%.2f mode=%s "
-            "tRoad=%.3f m curvature=%.5f 1/m baseline=%.2f deg delta=%.2f deg "
-            "laneWidth=%.2f m leftLimit=%.2f m rightLimit=%.2f m\n",
+            "dy=%.3f m id=%d ids=%s command=%.2f deg cost=%.2f mode=%s\n",
             SpeedStateName(speedState), SensorObstacleCount,
             NearestObstacleDx(), NearestObstacleDy(), nearestObjectId, obstacleIds,
             steeringCommand * 180.0 / Pi, mppiBestCost,
-            ControllerModeName(controllerMode),
-            Vehicle.Road.Path.tRoad, currentRoadCurvature,
-            ipgBaselineSteering * 180.0 / Pi, previousMppiDelta * 180.0 / Pi,
-            Vehicle.Road.Act.Width, CurrentLeftRoadLimit, CurrentRightRoadLimit);
+            ControllerModeName(controllerMode));
     }
 
     return 0;
@@ -1542,7 +1190,7 @@ User_VehicleControl_Calc(double dt)
     static bool first = true;
 
     if (first) {
-        Log("BUILD STAMP: LANE_RELATIVE_RIGHT_RAILING_V23 (built %s %s)\n", __DATE__, __TIME__);
+        Log("BUILD STAMP: CURVATURE_SIGN_REVERT_V5 (built %s %s)\n", __DATE__, __TIME__);
         Log("User_VehicleControl_Calc() is running!");
         first = false;
     }
@@ -1650,6 +1298,10 @@ User_Check_IsIdle(int IsIdle)
     if (Vehicle.Steering.Ang > val || Vehicle.Steering.Ang < -val) {
         IsIdle = 0;
     }
+# if defined(T3R_IF)
+    if (!T3R_IF_Check_IsIdle())
+        IsIdle = 0;
+# endif
 
     return IsIdle;
 }
@@ -1668,6 +1320,9 @@ User_Check_IsIdle(int IsIdle)
 void
 User_Out(unsigned const CycleNo)
 {
+# if defined(T3R_IF)
+    T3R_IF_Out();
+# endif
 
     if (SimCore.State != SCState_Simulate) {
         return;
@@ -1742,6 +1397,9 @@ User_ShutDown(int ShutDownForced)
     if (1) {
         IsDown = 1;
     }
+# if defined(T3R_IF)
+    T3R_IF_ShutDown();
+# endif
 
     return IsDown;
 }
