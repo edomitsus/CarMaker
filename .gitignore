@@ -83,3 +83,6 @@ Data/UserDriver/UserDriverTemplate
 # OS
 .DS_Store
 Thumbs.db
+movie.mp4
+movie_web.mp4
+default_view.mp4

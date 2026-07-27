@@ -368,9 +368,19 @@ constexpr double CollisionRiskTimeToCollision = 4.0;
    vehicle's own position) is appended to the rollout CSV, instead of the
    earlier one-shot single snapshot. MaxRolloutFrames is a hard cap so a
    long maneuver can't grow the file without bound; capture just stops past
-   that point (logged, not silent) rather than slowing the sim down. */
-constexpr double RolloutCaptureInterval = 0.5; /* [s] */
-constexpr int MaxRolloutFrames = 240;          /* 120 s of capture at the interval above */
+   that point (logged, not silent) rather than slowing the sim down.
+   FIX ("increase the amount of samples ... double or triple feasible" /
+   "can you make it double again" tasks): halved twice now, 0.5s -> 0.25s
+   -> 0.125s (4x the original density) for a denser capture (the video-
+   overlay camera interpolates between frames, but the actual path/road/
+   obstacle content still only updates once per captured frame, so a
+   shorter interval is what actually makes that content itself look more
+   continuous). MaxRolloutFrames doubled alongside it each time so the
+   total capture DURATION cap stays the same (120 s) rather than shrinking
+   as resolution increases - CSV file size scales with frame count, so
+   expect roughly 4x the original file size at this interval. */
+constexpr double RolloutCaptureInterval = 0.125; /* [s] */
+constexpr int MaxRolloutFrames = 960;            /* 120 s of capture at the interval above */
 
 /* FIX ("MPPI kicks in on a 90-degree turn for an obstacle that isn't
    really in the way" task): generous buffer beyond the current lane/
@@ -1748,7 +1758,7 @@ User_VehicleControl_Calc(double dt)
     static bool first = true;
 
     if (first) {
-        Log("BUILD STAMP: ROLLOUT_VIZ_OBSTACLES_V28 (built %s %s)\n", __DATE__, __TIME__);
+        Log("BUILD STAMP: ROLLOUT_VIZ_DENSER_CAPTURE_V30 (built %s %s)\n", __DATE__, __TIME__);
         Log("User_VehicleControl_Calc() is running!");
         first = false;
     }

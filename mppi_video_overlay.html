@@ -1,0 +1,578 @@
+<title>MPPI Video Overlay Calibration</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface:      #fcfcfb;
+    --page:         #f9f9f7;
+    --ink:          #0b0b0b;
+    --ink-2:        #52514e;
+    --ink-muted:    #898781;
+    --grid:         #e1e0d9;
+    --accent:       #2a78d6;
+    --accent-wash:  rgba(42,120,214,0.10);
+    --good:         #006300;
+    --obstacle:     #d03b3b;
+    --border:       rgba(11,11,11,0.10);
+    --ramp-100: #cde2fb; --ramp-150: #b7d3f6; --ramp-200: #9ec5f4; --ramp-250: #86b6ef;
+    --ramp-300: #6da7ec; --ramp-350: #5598e7; --ramp-400: #3987e5; --ramp-450: #2a78d6;
+    --ramp-500: #256abf; --ramp-550: #1c5cab; --ramp-600: #184f95; --ramp-650: #104281;
+    --ramp-700: #0d366b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface: #1a1a19; --page: #0d0d0d; --ink: #ffffff; --ink-2: #c3c2b7;
+      --ink-muted: #898781; --grid: #2c2c2a; --accent: #3987e5;
+      --accent-wash: rgba(57,135,229,0.16); --good: #0ca30c; --obstacle: #d03b3b;
+      --border: rgba(255,255,255,0.10);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface: #1a1a19; --page: #0d0d0d; --ink: #ffffff; --ink-2: #c3c2b7;
+    --ink-muted: #898781; --grid: #2c2c2a; --accent: #3987e5;
+    --accent-wash: rgba(57,135,229,0.16); --good: #0ca30c; --obstacle: #d03b3b;
+    --border: rgba(255,255,255,0.10);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 24px 20px 40px; display: flex; flex-direction: column; gap: 16px; }
+  h1 { font-size: 18px; font-weight: 700; margin: 0; letter-spacing: -0.01em; }
+  .sub { color: var(--ink-muted); font-size: 12.5px; }
+  .filebtn {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: var(--surface); border: 1px solid var(--border); color: var(--ink);
+    padding: 7px 14px; border-radius: 7px; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  .filebtn:hover { border-color: var(--accent); background: var(--accent-wash); }
+  .filebtn input { display: none; }
+  .status { font-size: 12.5px; color: var(--ink-muted); }
+  .status b { color: var(--ink); font-variant-numeric: tabular-nums; }
+
+  .layout { display: grid; grid-template-columns: 1fr 300px; gap: 16px; align-items: start; }
+  .stage {
+    position: relative; background: #000; border-radius: 12px; overflow: hidden;
+    border: 1px solid var(--border); aspect-ratio: 4 / 3; width: 100%;
+  }
+  .stage video, .stage canvas {
+    position: absolute; inset: 0; width: 100%; height: 100%; display: block;
+  }
+  .stage video { object-fit: contain; background: #000; }
+  .stage canvas { pointer-events: none; }
+
+  .panel {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px; display: flex; flex-direction: column; gap: 14px;
+  }
+  .panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--ink-muted); margin: 0 0 2px; }
+  .slider {
+    display: flex; flex-direction: column; gap: 3px; font-size: 12.5px;
+  }
+  .slider .row { display: flex; justify-content: space-between; color: var(--ink-2); }
+  .slider .row b { color: var(--ink); font-variant-numeric: tabular-nums; }
+  .slider input[type="range"] { width: 100%; accent-color: var(--accent); }
+  .presetbtn {
+    appearance: none; border: 1px solid var(--border); background: var(--page); color: var(--ink);
+    border-radius: 6px; padding: 5px 8px; font-size: 12px; cursor: pointer;
+  }
+  .presetbtn:hover { border-color: var(--accent); }
+  .presetrow { display: flex; gap: 6px; flex-wrap: wrap; }
+
+  footer { color: var(--ink-muted); font-size: 12px; max-width: 90ch; }
+  footer code { background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; font-size: 11.5px; }
+</style>
+
+<div class="wrap">
+  <div>
+    <h1>MPPI Video Overlay Calibration</h1>
+    <div class="sub">Drag the sliders until the projected road/paths line up with the real footage, then read off the values below.</div>
+  </div>
+
+  <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
+    <label class="filebtn">
+      <span>Load .tmp_mppi_rollout.csv</span>
+      <input type="file" id="csvInput" accept=".csv,text/csv" />
+    </label>
+    <div class="status" id="status">movie.mp4 loads automatically from this folder. Load the matching CSV to begin.</div>
+  </div>
+
+  <div class="layout">
+    <div class="stage" id="stage">
+      <video id="video" src="movie_web.mp4" controls muted playsinline></video>
+      <canvas id="overlay"></canvas>
+    </div>
+
+    <div class="panel">
+      <div>
+        <h2>Camera offset (vehicle-relative)</h2>
+        <div class="presetrow" style="margin-bottom:8px;">
+          <button type="button" class="presetbtn" data-preset="hood">Hood cam</button>
+          <button type="button" class="presetbtn" data-preset="roof">Roof cam</button>
+          <button type="button" class="presetbtn" data-preset="chase">Chase cam</button>
+        </div>
+        <div class="slider">
+          <div class="row"><span>Forward</span><b id="vForward">1.50 m</b></div>
+          <input type="range" id="sForward" min="-8" max="3" step="0.05" value="1.5" />
+        </div>
+        <div class="slider">
+          <div class="row"><span>Lateral (+ = left)</span><b id="vLateral">0.00 m</b></div>
+          <input type="range" id="sLateral" min="-2" max="2" step="0.02" value="0" />
+        </div>
+        <div class="slider">
+          <div class="row"><span>Height</span><b id="vHeight">1.20 m</b></div>
+          <input type="range" id="sHeight" min="0.3" max="3" step="0.02" value="1.2" />
+        </div>
+      </div>
+      <div>
+        <h2>Camera rotation (offset from heading)</h2>
+        <div class="slider">
+          <div class="row"><span>Yaw</span><b id="vYaw">-1.0°</b></div>
+          <input type="range" id="sYaw" min="-45" max="45" step="0.5" value="-1" />
+        </div>
+        <div class="slider">
+          <div class="row"><span>Pitch (+ = down)</span><b id="vPitch">5.0°</b></div>
+          <input type="range" id="sPitch" min="-30" max="45" step="0.5" value="5" />
+        </div>
+        <div class="slider">
+          <div class="row"><span>Roll</span><b id="vRoll">0.0°</b></div>
+          <input type="range" id="sRoll" min="-20" max="20" step="0.5" value="0" />
+        </div>
+      </div>
+      <div>
+        <h2>Lens</h2>
+        <div class="slider">
+          <div class="row"><span>Vertical FOV</span><b id="vFov">38°</b></div>
+          <input type="range" id="sFov" min="20" max="110" step="1" value="38" />
+        </div>
+      </div>
+      <div>
+        <h2>Cockpit</h2>
+        <div class="slider">
+          <div class="row"><span>Dashboard cutoff</span><b id="vDashboard">78%</b></div>
+          <input type="range" id="sDashboard" min="40" max="100" step="1" value="78" />
+        </div>
+        <div class="slider" style="margin-top:10px;">
+          <div class="row"><span>Vertical nudge (screen-space)</span><b id="vNudge">-14%</b></div>
+          <input type="range" id="sNudge" min="-40" max="40" step="1" value="-14" />
+        </div>
+        <div class="slider" style="margin-top:10px;">
+          <div class="row"><span>MPPI tracking latency</span><b id="vStaleThreshold">0.20 s</b></div>
+          <input type="range" id="sStaleThreshold" min="0.1" max="1.5" step="0.01" value="0.2" />
+        </div>
+      </div>
+      <div style="font-size:11.5px; color:var(--ink-muted); border-top:1px solid var(--border); padding-top:10px;">
+        Frame: <span id="frameInfo">—</span>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    The camera is assumed rigidly fixed to the vehicle body, so its world position/orientation each moment is derived
+    from that frame's captured vehicle pose (<code>car.x, car.y, car.yaw</code>) plus the offset/rotation set above -
+    the same math used for the road/path overlay, just driven by the offset you're tuning rather than a synthetic
+    view. Paths only redraw at the ~0.5s rate they were captured at, so the overlay updates in steps while the video
+    itself plays smoothly. Scrub or play the video normally; the overlay follows <code>video.currentTime</code>
+    against each frame's <code>simTime</code> from the CSV.
+  </footer>
+</div>
+
+<script>
+(function () {
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('overlay');
+  const ctx = canvas.getContext('2d');
+  const csvInput = document.getElementById('csvInput');
+  const statusEl = document.getElementById('status');
+  const frameInfo = document.getElementById('frameInfo');
+
+  const RAMP_LIGHT = ['ramp-100','ramp-150','ramp-200','ramp-250','ramp-300','ramp-350','ramp-400','ramp-450','ramp-500','ramp-550','ramp-600','ramp-650','ramp-700'];
+
+  let data = null; // { meta, frames: [...] }
+
+  const cam = { forward: 1.5, lateral: 0, height: 1.2, yaw: -1, pitch: 5, roll: 0, fov: 38, dashboard: 78, nudge: -14, staleThreshold: 0.2 };
+  const PRESETS = {
+    hood:  { forward: 1.5, lateral: 0, height: 1.1, yaw: 0, pitch: 6, roll: 0, fov: 60 },
+    roof:  { forward: 0.2, lateral: 0, height: 1.7, yaw: 0, pitch: 4, roll: 0, fov: 55 },
+    chase: { forward: -6.0, lateral: 0, height: 2.4, yaw: 0, pitch: 10, roll: 0, fov: 45 },
+  };
+
+  function isDark() {
+    const stamp = document.documentElement.getAttribute('data-theme');
+    if (stamp === 'dark') return true;
+    if (stamp === 'light') return false;
+    return window.matchMedia('(prefers-color-scheme: dark)').matches;
+  }
+  function rampColor(t) {
+    const steps = isDark() ? RAMP_LIGHT.slice().reverse() : RAMP_LIGHT;
+    const idx = Math.max(0, Math.min(steps.length - 1, Math.round(t * (steps.length - 1))));
+    return getComputedStyle(document.documentElement).getPropertyValue('--' + steps[idx]).trim();
+  }
+
+  function mkTrack() { return { s: [], t: [], x: [], y: [] }; }
+
+  function parseCSV(text) {
+    const lines = text.split(/\r?\n/);
+    const meta = { left_limit: 0, right_limit: 0 };
+    const byFrame = new Map();
+    function frameRec(idx) {
+      let f = byFrame.get(idx);
+      if (!f) {
+        f = { frameIndex: idx, simTime: 0, car: null, samples: new Map(), obstacles: [],
+              road: { center: mkTrack(), left: mkTrack(), right: mkTrack() } };
+        byFrame.set(idx, f);
+      }
+      return f;
+    }
+    let sawHeader = false;
+    for (const line of lines) {
+      if (!line) continue;
+      if (line[0] === '#') {
+        line.slice(1).trim().split(/\s+/).forEach(function (kv) {
+          const eq = kv.indexOf('=');
+          if (eq > 0) meta[kv.slice(0, eq)] = parseFloat(kv.slice(eq + 1));
+        });
+        continue;
+      }
+      if (!sawHeader) { sawHeader = true; continue; }
+      const parts = line.split(',');
+      if (parts.length < 10) continue;
+      const kind = parts[0], sampleId = parts[1], cost = parseFloat(parts[2]);
+      const s = parseFloat(parts[4]), t = parseFloat(parts[5]), x = parseFloat(parts[6]), y = parseFloat(parts[7]);
+      const frameIdx = parseInt(parts[8], 10), yaw = parseFloat(parts[9]);
+      const f = frameRec(frameIdx);
+      if (kind === 'F') { f.simTime = cost; f.car = { s, t, x, y, yaw }; continue; }
+      if (kind === 'R') {
+        const track = f.road[sampleId];
+        if (track) { track.s.push(s); track.t.push(t); track.x.push(x); track.y.push(y); }
+        continue;
+      }
+      if (kind === 'O') { f.obstacles.push({ objId: sampleId, radius: cost, s, t, x, y }); continue; }
+      let rec = f.samples.get(sampleId);
+      if (!rec) { rec = { sample: sampleId, cost, s: [], t: [], x: [], y: [] }; f.samples.set(sampleId, rec); }
+      rec.s.push(s); rec.t.push(t); rec.x.push(x); rec.y.push(y);
+    }
+    const frames = Array.from(byFrame.values()).sort((a, b) => a.frameIndex - b.frameIndex);
+    frames.forEach(function (f) { f.samples = Array.from(f.samples.values()); });
+    carryForwardObstacles(frames);
+    return { meta, frames };
+  }
+
+  function carryForwardObstacles(frames) {
+    const lastKnown = new Map();
+    frames.forEach(function (f) {
+      const seen = new Set();
+      f.obstacles.forEach(function (o) { seen.add(o.objId); lastKnown.set(o.objId, o); });
+      lastKnown.forEach(function (o, objId) {
+        if (!seen.has(objId)) f.obstacles.push({ objId: o.objId, radius: o.radius, s: o.s, t: o.t, x: o.x, y: o.y });
+      });
+    });
+  }
+
+  function nearestFrame(simTime) {
+    if (!data || !data.frames.length) return null;
+    let best = data.frames[0], bestDist = Infinity;
+    data.frames.forEach(function (f) {
+      const d = Math.abs(f.simTime - simTime);
+      if (d < bestDist) { bestDist = d; best = f; }
+    });
+    return { frame: best, dist: bestDist };
+  }
+
+  /* Smooths the CAMERA specifically (see "smoother" task), not the sample
+     paths themselves: each captured frame's 256 rollouts are freshly
+     re-sampled noise, with no correspondence between "sample 3 in frame A"
+     and "sample 3 in frame B" - blending those would just average unrelated
+     random paths together and mean nothing. The car's own position/heading,
+     though, is a single continuous quantity, and it's what the camera is
+     built from - interpolating THAT removes the camera-jump that was
+     making everything else look like it was snapping too, even though the
+     path/obstacle content underneath still legitimately updates in steps. */
+  function interpolatedCarPose(simTime) {
+    const frames = data.frames;
+    let i = 0;
+    while (i < frames.length - 1 && frames[i + 1].simTime <= simTime) i++;
+    const a = frames[i], b = frames[Math.min(i + 1, frames.length - 1)];
+    if (a === b || !a.car || !b.car) return (a.car || b.car);
+    const span = b.simTime - a.simTime;
+    const t = span > 1e-6 ? Math.max(0, Math.min(1, (simTime - a.simTime) / span)) : 0;
+    let dyaw = b.car.yaw - a.car.yaw;
+    while (dyaw > Math.PI) dyaw -= 2 * Math.PI;
+    while (dyaw < -Math.PI) dyaw += 2 * Math.PI;
+    return {
+      x: a.car.x + (b.car.x - a.car.x) * t,
+      y: a.car.y + (b.car.y - a.car.y) * t,
+      yaw: a.car.yaw + dyaw * t,
+    };
+  }
+
+  // --- camera math ---
+  function buildCamera(car) {
+    const yaw = car.yaw + cam.yaw * Math.PI / 180;
+    const pitch = cam.pitch * Math.PI / 180;
+    const cosYawV = Math.cos(car.yaw), sinYawV = Math.sin(car.yaw);
+    // camera position: vehicle position + (forward, lateral, height) rotated by the VEHICLE's own yaw
+    const posX = car.x + cam.forward * cosYawV - cam.lateral * sinYawV;
+    const posY = car.y + cam.forward * sinYawV + cam.lateral * cosYawV;
+    const posZ = cam.height;
+    const forward = [Math.cos(pitch) * Math.cos(yaw), Math.cos(pitch) * Math.sin(yaw), Math.sin(pitch)];
+    // FIX ("why did you shift it right?" task): this was [-sin(yaw), cos(yaw), 0], which at
+    // yaw=0 points toward world +Y - but +Y is LEFT throughout this project (see
+    // PreferredPassingLateralPosition / "positive t = left" convention), so this vector was
+    // actually WORLD LEFT mislabeled as "right". Since camX (screen-horizontal) is computed by
+    // dot(rel, right), using left-in-right's-place silently mirrored every horizontal
+    // projection - explains why decreasing yaw moved the overlay right instead of left.
+    let right = [Math.sin(yaw), -Math.cos(yaw), 0];
+    const roll = cam.roll * Math.PI / 180;
+    if (roll) {
+      // rotate 'right'/'up' pair around forward axis by roll - only right needs updating here,
+      // 'up' is re-derived via cross product afterward so it stays orthogonal
+      const upTmp = cross(right, forward);
+      const c = Math.cos(roll), s = Math.sin(roll);
+      right = [
+        right[0] * c + upTmp[0] * s,
+        right[1] * c + upTmp[1] * s,
+        right[2] * c + upTmp[2] * s,
+      ];
+    }
+    // cross(right, forward), not cross(forward, right): 'right' now means true right (not
+    // left), so the operand order has to flip too to keep 'up' pointing up rather than down.
+    const up = cross(right, forward);
+    return { pos: [posX, posY, posZ], forward, right, up };
+  }
+  function cross(a, b) {
+    return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+  }
+  function dot(a, b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
+
+  // The <video> uses object-fit:contain inside a stage box that isn't
+  // necessarily the video's own aspect ratio, so the ACTUAL displayed
+  // video frame is a letterboxed/pillarboxed sub-rectangle of the canvas,
+  // not the full canvas. Projecting against the full canvas size silently
+  // misaligns everything by however much letterbox padding exists - this
+  // computes that real sub-rectangle so drawing can be anchored to it.
+  function videoDisplayRect(stageW, stageH) {
+    const vw = video.videoWidth || 480, vh = video.videoHeight || 360;
+    const stageAspect = stageW / stageH, videoAspect = vw / vh;
+    if (videoAspect > stageAspect) {
+      const w = stageW, h = stageW / videoAspect;
+      return { x: 0, y: (stageH - h) / 2, w, h };
+    }
+    const h = stageH, w = stageH * videoAspect;
+    return { x: (stageW - w) / 2, y: 0, w, h };
+  }
+
+  function project(camera, x, y, z, vRect) {
+    const rel = [x - camera.pos[0], y - camera.pos[1], z - camera.pos[2]];
+    const camX = dot(rel, camera.right);
+    const camY = dot(rel, camera.up);
+    const camZ = dot(rel, camera.forward);
+    if (camZ < 0.05) return null;
+    const focal = (vRect.h / 2) / Math.tan((cam.fov * Math.PI / 180) / 2);
+    // plain screen-space nudge (see "just move the whole path display up"
+    // task) - independent of the actual 3D/pitch math, a quick way to
+    // shift everything without re-deriving the physical camera angle.
+    const nudgeY = (cam.nudge / 100) * vRect.h;
+    return {
+      x: vRect.x + vRect.w / 2 + (camX / camZ) * focal,
+      y: vRect.y + vRect.h / 2 - (camY / camZ) * focal + nudgeY,
+      depth: camZ,
+    };
+  }
+
+  function render() {
+    const rect = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const W = rect.width, H = rect.height;
+    ctx.clearRect(0, 0, W, H);
+    if (!data) return;
+
+    const nearest = nearestFrame(video.currentTime);
+    if (!nearest || !nearest.frame.car) return;
+    const f = nearest.frame;
+    // Frames only exist from whenever MPPI first engaged onward, not from
+    // video start - anywhere before/between real captures, this is just
+    // holding the closest one rather than showing something truly synced.
+    // Half the ~0.5s capture interval (plus margin) is a reasonable
+    // "this is stale" threshold.
+    const stale = nearest.dist > cam.staleThreshold;
+    if (stale) {
+      // MPPI wasn't actually engaged/producing a real frame near this video
+      // moment (see "only display the path when MPPI is activated" task) -
+      // show that plainly instead of drawing a stale, un-synced overlay.
+      frameInfo.textContent = 'video ' + video.currentTime.toFixed(2) + 's · MPPI not engaged here (nearest capture Δ'
+        + nearest.dist.toFixed(2) + 's away)';
+      frameInfo.style.color = getComputedStyle(document.documentElement).getPropertyValue('--obstacle').trim();
+      return;
+    }
+    frameInfo.textContent = 'frame ' + f.frameIndex + ' · simTime ' + f.simTime.toFixed(2) + 's · video ' + video.currentTime.toFixed(2) + 's';
+    frameInfo.style.color = '';
+
+    const vRect = videoDisplayRect(W, H);
+    const camera = buildCamera(interpolatedCarPose(video.currentTime));
+    function P(x, y, z) { return project(camera, x, y, z ?? 0, vRect); }
+
+    const good = getComputedStyle(document.documentElement).getPropertyValue('--good').trim();
+    const obstacleColor = getComputedStyle(document.documentElement).getPropertyValue('--obstacle').trim();
+
+    // From a driver's seated POV, the road right in front of the hood is
+    // physically hidden behind the dashboard - clip everything below that
+    // line so paths don't visually "sink into" the dashboard instead of
+    // disappearing behind it, matching the real view. Anchored to the
+    // actual displayed video rect, not the full canvas.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(vRect.x, vRect.y, vRect.w, vRect.h * cam.dashboard / 100);
+    ctx.clip();
+
+    // road ribbon
+    if (f.road.left.x.length && f.road.right.x.length && f.road.left.x.length === f.road.right.x.length) {
+      ctx.beginPath();
+      let started = false;
+      for (let i = 0; i < f.road.left.x.length; i++) {
+        const p = P(f.road.left.x[i], f.road.left.y[i]);
+        if (!p) continue;
+        if (!started) { ctx.moveTo(p.x, p.y); started = true; } else { ctx.lineTo(p.x, p.y); }
+      }
+      for (let i = f.road.right.x.length - 1; i >= 0; i--) {
+        const p = P(f.road.right.x[i], f.road.right.y[i]);
+        if (p) ctx.lineTo(p.x, p.y);
+      }
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(90,180,255,0.18)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(90,180,255,0.85)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    // sample paths
+    const costs = f.samples.map(r => r.cost).sort((a, b) => a - b);
+    function rankOf(c) {
+      let lo = 0, hi = costs.length;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (costs[mid] < c) lo = mid + 1; else hi = mid; }
+      return costs.length <= 1 ? 0 : lo / (costs.length - 1);
+    }
+    let best = f.samples[0];
+    f.samples.forEach(r => { if (r.cost < best.cost) best = r; });
+    f.samples.slice().sort((a, b) => b.cost - a.cost).forEach(function (rec) {
+      if (rec === best) return;
+      ctx.beginPath();
+      let started = false;
+      for (let i = 0; i < rec.x.length; i++) {
+        const p = P(rec.x[i], rec.y[i]);
+        if (!p) continue;
+        if (!started) { ctx.moveTo(p.x, p.y); started = true; } else { ctx.lineTo(p.x, p.y); }
+      }
+      ctx.strokeStyle = rampColor(rankOf(rec.cost));
+      ctx.globalAlpha = 0.65;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    });
+    ctx.globalAlpha = 1;
+    if (best) {
+      ctx.beginPath();
+      let started = false;
+      for (let i = 0; i < best.x.length; i++) {
+        const p = P(best.x[i], best.y[i]);
+        if (!p) continue;
+        if (!started) { ctx.moveTo(p.x, p.y); started = true; } else { ctx.lineTo(p.x, p.y); }
+      }
+      ctx.strokeStyle = good;
+      ctx.lineWidth = 3;
+      ctx.stroke();
+    }
+
+    // obstacles: small ground-plane circles at their real radius
+    f.obstacles.forEach(function (o) {
+      const N = 16;
+      ctx.beginPath();
+      let started = false;
+      for (let i = 0; i <= N; i++) {
+        const a = (i / N) * Math.PI * 2;
+        const p = P(o.x + Math.cos(a) * o.radius, o.y + Math.sin(a) * o.radius);
+        if (!p) continue;
+        if (!started) { ctx.moveTo(p.x, p.y); started = true; } else { ctx.lineTo(p.x, p.y); }
+      }
+      ctx.closePath();
+      ctx.strokeStyle = obstacleColor;
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+    });
+
+    ctx.restore();
+  }
+
+  function bindSlider(id, key, unit, fmt) {
+    const input = document.getElementById(id);
+    const label = document.getElementById('v' + key.charAt(0).toUpperCase() + key.slice(1));
+    function update() {
+      cam[key] = parseFloat(input.value);
+      label.textContent = (fmt ? fmt(cam[key]) : cam[key].toFixed(2)) + unit;
+      render();
+    }
+    input.addEventListener('input', update);
+    update();
+  }
+  bindSlider('sForward', 'forward', ' m');
+  bindSlider('sLateral', 'lateral', ' m');
+  bindSlider('sHeight', 'height', ' m');
+  bindSlider('sYaw', 'yaw', '°', v => v.toFixed(1));
+  bindSlider('sPitch', 'pitch', '°', v => v.toFixed(1));
+  bindSlider('sRoll', 'roll', '°', v => v.toFixed(1));
+  bindSlider('sFov', 'fov', '°', v => v.toFixed(0));
+  bindSlider('sDashboard', 'dashboard', '%', v => v.toFixed(0));
+  bindSlider('sNudge', 'nudge', '%', v => v.toFixed(0));
+  bindSlider('sStaleThreshold', 'staleThreshold', ' s', v => v.toFixed(2));
+
+  document.querySelectorAll('.presetbtn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      const p = PRESETS[btn.dataset.preset];
+      Object.keys(p).forEach(function (k) {
+        cam[k] = p[k];
+        const sliderId = 's' + k.charAt(0).toUpperCase() + k.slice(1);
+        document.getElementById(sliderId).value = p[k];
+      });
+      ['forward','lateral','height','yaw','pitch','roll','fov'].forEach(function (k) {
+        document.getElementById('s' + k.charAt(0).toUpperCase() + k.slice(1)).dispatchEvent(new Event('input'));
+      });
+    });
+  });
+
+  csvInput.addEventListener('change', function (e) {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = function () {
+      data = parseCSV(reader.result);
+      statusEl.textContent = data.frames.length + ' frames loaded from ' + f.name + '. Adjust sliders while scrubbing the video.';
+      render();
+    };
+    reader.readAsText(f);
+  });
+
+  // FIX ("still not seeing the faster rate" task): 'timeupdate' only fires
+  // ~4 times/sec in most browsers - it's not tied to the video's actual
+  // frame rate or any high-frequency clock, so no matter how dense the
+  // captured CSV data is, render() was never being called often enough to
+  // show it. A persistent requestAnimationFrame loop redraws at full
+  // display refresh rate instead, reading video.currentTime fresh every
+  // frame - this is what actually lets the denser capture (and the earlier
+  // camera interpolation) show through.
+  function frameLoop() {
+    render();
+    requestAnimationFrame(frameLoop);
+  }
+  requestAnimationFrame(frameLoop);
+
+  video.addEventListener('loadedmetadata', render);
+  window.addEventListener('resize', render);
+  const mq = window.matchMedia('(prefers-color-scheme: dark)');
+  if (mq.addEventListener) mq.addEventListener('change', render);
+})();
+</script>
