@@ -1,0 +1,891 @@
+<title>MPPI Rollout Viewer</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface:      #fcfcfb;
+    --page:         #f9f9f7;
+    --ink:          #0b0b0b;
+    --ink-2:        #52514e;
+    --ink-muted:    #898781;
+    --grid:         #e1e0d9;
+    --axis:         #c3c2b7;
+    --accent:       #2a78d6;
+    --accent-wash:  rgba(42,120,214,0.10);
+    --good:         #006300;
+    --obstacle:     #d03b3b;
+    --road-surface: #e7e6e1;
+    --border:       rgba(11,11,11,0.10);
+    --ramp-100: #cde2fb; --ramp-150: #b7d3f6; --ramp-200: #9ec5f4; --ramp-250: #86b6ef;
+    --ramp-300: #6da7ec; --ramp-350: #5598e7; --ramp-400: #3987e5; --ramp-450: #2a78d6;
+    --ramp-500: #256abf; --ramp-550: #1c5cab; --ramp-600: #184f95; --ramp-650: #104281;
+    --ramp-700: #0d366b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface:     #1a1a19;
+      --page:        #0d0d0d;
+      --ink:         #ffffff;
+      --ink-2:       #c3c2b7;
+      --ink-muted:   #898781;
+      --grid:        #2c2c2a;
+      --axis:        #383835;
+      --accent:      #3987e5;
+      --accent-wash: rgba(57,135,229,0.16);
+      --good:        #0ca30c;
+      --obstacle:    #d03b3b;
+      --road-surface:#242422;
+      --border:      rgba(255,255,255,0.10);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface:     #1a1a19;
+    --page:        #0d0d0d;
+    --ink:         #ffffff;
+    --ink-2:       #c3c2b7;
+    --ink-muted:   #898781;
+    --grid:        #2c2c2a;
+    --axis:        #383835;
+    --accent:      #3987e5;
+    --accent-wash: rgba(57,135,229,0.16);
+    --good:        #0ca30c;
+    --obstacle:    #d03b3b;
+    --road-surface:#242422;
+    --border:      rgba(255,255,255,0.10);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    min-height: 100vh;
+  }
+  .wrap {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 24px 20px 40px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px 20px;
+  }
+  h1 {
+    font-size: 18px;
+    font-weight: 700;
+    margin: 0;
+    letter-spacing: -0.01em;
+  }
+  .sub {
+    color: var(--ink-muted);
+    font-size: 12.5px;
+  }
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-left: auto;
+  }
+  .filebtn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--ink);
+    padding: 7px 14px;
+    border-radius: 7px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: border-color 120ms ease, background 120ms ease;
+  }
+  .filebtn:hover { border-color: var(--accent); background: var(--accent-wash); }
+  .filebtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .filebtn input { display: none; }
+  .filebtn svg { width: 14px; height: 14px; flex: none; }
+
+  .seg {
+    display: inline-flex;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 2px;
+    gap: 2px;
+  }
+  .seg button {
+    appearance: none;
+    border: none;
+    background: transparent;
+    color: var(--ink-2);
+    font: inherit;
+    font-size: 12.5px;
+    font-weight: 600;
+    padding: 5px 10px;
+    border-radius: 5px;
+    cursor: pointer;
+  }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+  .seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .playbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+  .playbtn {
+    appearance: none;
+    border: none;
+    background: var(--accent);
+    color: #fff;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+  }
+  .playbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .playbtn svg { width: 13px; height: 13px; }
+  .scrub {
+    flex: 1;
+    accent-color: var(--accent);
+  }
+  .frameLabel {
+    font-variant-numeric: tabular-nums;
+    font-size: 12.5px;
+    color: var(--ink-2);
+    flex: none;
+    min-width: 132px;
+    text-align: right;
+  }
+  .playbar[hidden] { display: none; }
+
+  .stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 24px;
+    padding: 12px 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    font-size: 12.5px;
+  }
+  .stat { display: flex; gap: 6px; align-items: baseline; }
+  .stat b {
+    font-variant-numeric: tabular-nums;
+    font-size: 13px;
+    color: var(--ink);
+  }
+  .stat span { color: var(--ink-muted); }
+
+  .board {
+    display: grid;
+    grid-template-columns: 1fr 96px;
+    gap: 0;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .plotwrap {
+    position: relative;
+    aspect-ratio: 16 / 9;
+    min-height: 420px;
+  }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .empty[hidden] { display: none; }
+  .empty {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--ink-muted);
+    font-size: 13px;
+    text-align: center;
+    padding: 0 40px;
+  }
+  .legend {
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 18px 0;
+    gap: 8px;
+  }
+  .legend .cap { font-size: 10.5px; color: var(--ink-muted); text-transform: uppercase; letter-spacing: 0.04em; text-align: center; padding: 0 6px; }
+  .ramp {
+    width: 14px;
+    flex: 1;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+  }
+  .legend .lo, .legend .hi { font-size: 11px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .swatchrow { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--ink-2); margin-top: 4px; }
+  .swatch { width: 16px; height: 2px; border-radius: 1px; flex: none; }
+
+  .tooltip {
+    position: absolute;
+    pointer-events: none;
+    background: var(--ink);
+    color: var(--surface);
+    font-size: 12px;
+    padding: 6px 9px;
+    border-radius: 6px;
+    line-height: 1.5;
+    transform: translate(-50%, calc(-100% - 10px));
+    white-space: nowrap;
+    opacity: 0;
+    transition: opacity 80ms ease;
+    z-index: 5;
+    font-variant-numeric: tabular-nums;
+  }
+  .tooltip b { font-weight: 700; }
+
+  footer {
+    color: var(--ink-muted);
+    font-size: 12px;
+    max-width: 72ch;
+  }
+  footer code {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-size: 11.5px;
+  }
+</style>
+
+<div class="wrap">
+  <header>
+    <div>
+      <h1>MPPI Rollout Viewer</h1>
+      <div class="sub">Every sampled path, replayed frame by frame as the car moves, colored by cost rank</div>
+    </div>
+    <div class="controls">
+      <div class="seg" id="frameToggle" role="group" aria-label="Coordinate frame">
+        <button type="button" data-frame="world" aria-pressed="true">World shape</button>
+        <button type="button" data-frame="road" aria-pressed="false">Road-relative (s,t)</button>
+      </div>
+      <label class="filebtn" id="fileBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        <span id="fileBtnLabel">Load .tmp_mppi_rollout.csv</span>
+        <input type="file" id="fileInput" accept=".csv,text/csv" />
+      </label>
+    </div>
+  </header>
+
+  <div class="stats" id="stats" hidden></div>
+
+  <div class="playbar" id="playbar" hidden>
+    <button type="button" class="playbtn" id="playBtn" aria-label="Play">
+      <svg id="playIcon" viewBox="0 0 24 24" fill="currentColor"><polygon points="6,4 20,12 6,20"/></svg>
+      <svg id="pauseIcon" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="5" y="4" width="5" height="16"/><rect x="14" y="4" width="5" height="16"/></svg>
+    </button>
+    <input type="range" class="scrub" id="scrub" min="0" max="0" value="0" step="1" />
+    <div class="frameLabel" id="frameLabel">frame 0 / 0 · t=0.00s</div>
+  </div>
+
+  <div class="board">
+    <div class="plotwrap">
+      <canvas id="plot"></canvas>
+      <div class="tooltip" id="tooltip"></div>
+      <div class="empty" id="empty">
+        Run the sim once, then load<br /><code style="margin-top:6px;display:inline-block">Data/TestRun/.tmp_mppi_rollout.csv</code>
+      </div>
+    </div>
+    <div class="legend" id="legend" hidden>
+      <div class="cap">Cost&nbsp;rank</div>
+      <div class="hi" id="legendHi">worst</div>
+      <div class="ramp" id="ramp"></div>
+      <div class="lo" id="legendLo">best</div>
+    </div>
+  </div>
+
+  <footer>
+    Color encodes each sample's <b style="color:var(--ink-2)">rank</b> among this batch, not its raw cost — a few
+    guardrail-violating samples can carry costs orders of magnitude above the rest, which would otherwise crush
+    every other path to one color. The
+    <span class="swatchrow" style="display:inline-flex;vertical-align:middle"><span class="swatch" style="background:var(--good)"></span></span>
+    green path is the single lowest-cost sample; the
+    <span class="swatchrow" style="display:inline-flex;vertical-align:middle"><span class="swatch" style="background:var(--accent);border-radius:50%;width:8px;height:8px"></span></span>
+    blue marker/arrow is the ego vehicle; the
+    <span class="swatchrow" style="display:inline-flex;vertical-align:middle"><span class="swatch" style="background:var(--obstacle);border-radius:50%;width:8px;height:8px"></span></span>
+    red marker is an obstacle (sized to its real radius in World shape) — once it leaves the sensor's forward
+    view (e.g. after the car passes it), it dims to show its last known position rather than vanishing. The
+    shaded ribbon is the
+    drivable lane surface between the current left/right limits; the dashed line down its middle is lane
+    center. <b style="color:var(--ink-2)">World shape</b> plots real ground position (matches the driving
+    screen, curves and all); <b style="color:var(--ink-2)">road-relative</b> plots MPPI's own internal frame
+    (distance along the road vs. lateral offset), where the road is always a flat band — useful for reading
+    lateral error directly, but it won't look like the real path on a curve. Frames were captured every 0.5s
+    while MPPI was actively engaged, not the whole run.
+  </footer>
+</div>
+
+<script>
+(function () {
+  const RAMP_LIGHT = ['ramp-100','ramp-150','ramp-200','ramp-250','ramp-300','ramp-350','ramp-400','ramp-450','ramp-500','ramp-550','ramp-600','ramp-650','ramp-700'];
+  const canvas = document.getElementById('plot');
+  const ctx = canvas.getContext('2d');
+  const tooltip = document.getElementById('tooltip');
+  const emptyEl = document.getElementById('empty');
+  const statsEl = document.getElementById('stats');
+  const legendEl = document.getElementById('legend');
+  const rampEl = document.getElementById('ramp');
+  const fileInput = document.getElementById('fileInput');
+  const fileBtnLabel = document.getElementById('fileBtnLabel');
+  const frameToggle = document.getElementById('frameToggle');
+  const playbar = document.getElementById('playbar');
+  const playBtn = document.getElementById('playBtn');
+  const playIcon = document.getElementById('playIcon');
+  const pauseIcon = document.getElementById('pauseIcon');
+  const scrub = document.getElementById('scrub');
+  const frameLabel = document.getElementById('frameLabel');
+
+  let data = null; // { meta, frames: [{frameIndex, simTime, car:{s,t,x,y,yaw}, samples:[...], road:{center,left,right}}] }
+  let bnds = null; // precomputed global bounds, world + road, so viewport doesn't jump between frames
+  let viewFrame = 'world'; // 'world' | 'road'
+  let playIndex = 0;
+  let playing = false;
+  let playTimer = null;
+
+  function isDark() {
+    const stamp = document.documentElement.getAttribute('data-theme');
+    if (stamp === 'dark') return true;
+    if (stamp === 'light') return false;
+    return window.matchMedia('(prefers-color-scheme: dark)').matches;
+  }
+
+  function rampColor(t /* 0..1 */) {
+    const steps = isDark() ? RAMP_LIGHT.slice().reverse() : RAMP_LIGHT;
+    const idx = Math.max(0, Math.min(steps.length - 1, Math.round(t * (steps.length - 1))));
+    return getComputedStyle(document.documentElement).getPropertyValue('--' + steps[idx]).trim();
+  }
+
+  function mkTrack() { return { s: [], t: [], x: [], y: [] }; }
+
+  function parseCSV(text) {
+    const lines = text.split(/\r?\n/);
+    const meta = { left_limit: 0, right_limit: 0, capture_interval: 0.5 };
+    const byFrame = new Map();
+    function frameRec(idx) {
+      let f = byFrame.get(idx);
+      if (!f) {
+        f = { frameIndex: idx, simTime: 0, car: null, samples: new Map(), obstacles: [],
+              road: { center: mkTrack(), left: mkTrack(), right: mkTrack() } };
+        byFrame.set(idx, f);
+      }
+      return f;
+    }
+    let sawHeader = false;
+    for (const line of lines) {
+      if (!line) continue;
+      if (line[0] === '#') {
+        line.slice(1).trim().split(/\s+/).forEach(function (kv) {
+          const eq = kv.indexOf('=');
+          if (eq > 0) meta[kv.slice(0, eq)] = parseFloat(kv.slice(eq + 1));
+        });
+        continue;
+      }
+      if (!sawHeader) { sawHeader = true; continue; }
+      const parts = line.split(',');
+      if (parts.length < 10) continue;
+      const kind = parts[0], sampleId = parts[1], cost = parseFloat(parts[2]);
+      const s = parseFloat(parts[4]), t = parseFloat(parts[5]), x = parseFloat(parts[6]), y = parseFloat(parts[7]);
+      const frameIdx = parseInt(parts[8], 10), yaw = parseFloat(parts[9]);
+      const f = frameRec(frameIdx);
+      if (kind === 'F') {
+        f.simTime = cost;
+        f.car = { s: s, t: t, x: x, y: y, yaw: yaw };
+        continue;
+      }
+      if (kind === 'R') {
+        const track = f.road[sampleId];
+        if (track) { track.s.push(s); track.t.push(t); track.x.push(x); track.y.push(y); }
+        continue;
+      }
+      if (kind === 'O') {
+        f.obstacles.push({ objId: sampleId, radius: cost, s: s, t: t, x: x, y: y });
+        continue;
+      }
+      let rec = f.samples.get(sampleId);
+      if (!rec) { rec = { sample: sampleId, cost: cost, s: [], t: [], x: [], y: [] }; f.samples.set(sampleId, rec); }
+      rec.s.push(s); rec.t.push(t); rec.x.push(x); rec.y.push(y);
+    }
+    const frames = Array.from(byFrame.values()).sort(function (a, b) { return a.frameIndex - b.frameIndex; });
+    frames.forEach(function (f) { f.samples = Array.from(f.samples.values()); });
+    carryForwardObstacles(frames);
+    return { meta: meta, frames: frames, roadFull: stitchRoad(frames) };
+  }
+
+  /* Obstacles only appear in a frame's export while the Object Sensor is
+     actually tracking them (same forward view the controller itself uses)
+     - once the car passes one, it drops out of range and the raw data has
+     no more rows for it. Rather than let the marker just vanish, carry its
+     last known position forward into later frames (dimmed, so it reads as
+     "last known position" rather than live tracking) - these scenarios'
+     obstacles are effectively stationary, so the last seen position stays
+     accurate after passing it. */
+  function carryForwardObstacles(frames) {
+    const lastKnown = new Map();
+    frames.forEach(function (f) {
+      const seenThisFrame = new Set();
+      f.obstacles.forEach(function (o) { seenThisFrame.add(o.objId); lastKnown.set(o.objId, o); });
+      lastKnown.forEach(function (o, objId) {
+        if (!seenThisFrame.has(objId)) {
+          f.obstacles.push({ objId: o.objId, radius: o.radius, s: o.s, t: o.t, x: o.x, y: o.y, carried: true });
+        }
+      });
+    });
+  }
+
+  /* Preprocess the road geometry ONCE at load time (see "preprocess it so
+     the road ... [is] loaded at the start" task): each captured frame only
+     carries the road reference for ITS OWN local rollout window, which
+     slides forward with the car - drawing that per-frame would make the
+     road ribbon subtly shift/resize every frame during playback instead of
+     being a stable backdrop. Stitching every frame's points into one
+     sorted-by-s track up front means the road is drawn once as a fixed
+     shape, and only the car/paths/obstacles animate on top of it. */
+  function stitchRoad(frames) {
+    const roadFull = { center: mkTrack(), left: mkTrack(), right: mkTrack() };
+    ['center', 'left', 'right'].forEach(function (k) {
+      const seen = new Set();
+      const points = [];
+      frames.forEach(function (f) {
+        const track = f.road[k];
+        for (let i = 0; i < track.s.length; i++) {
+          const key = track.s[i].toFixed(1);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          points.push({ s: track.s[i], t: track.t[i], x: track.x[i], y: track.y[i] });
+        }
+      });
+      points.sort(function (a, b) { return a.s - b.s; });
+      points.forEach(function (p) {
+        roadFull[k].s.push(p.s); roadFull[k].t.push(p.t);
+        roadFull[k].x.push(p.x); roadFull[k].y.push(p.y);
+      });
+    });
+    return roadFull;
+  }
+
+  /* Local heading estimate along the stitched road center line at a given
+     s (see "car images / rectangle" task): used to orient an obstacle's
+     rectangle in World shape, since obstacles don't carry their own
+     heading in the export - assumes it's roughly aligned with the road,
+     a reasonable default for traffic in these scenarios. */
+  function roadHeadingAt(s) {
+    const c = data.roadFull.center;
+    if (c.s.length < 2) return 0;
+    let i = 0;
+    while (i < c.s.length - 2 && c.s[i + 1] < s) i++;
+    const dx = c.x[i + 1] - c.x[i], dy = c.y[i + 1] - c.y[i];
+    return Math.atan2(dy, dx);
+  }
+
+  function fmt(n, digits) {
+    if (!isFinite(n)) return '—';
+    if (Math.abs(n) >= 1000) return n.toLocaleString(undefined, { maximumFractionDigits: 0 });
+    return n.toFixed(digits == null ? 2 : digits);
+  }
+
+  // global bounds across ALL frames, so the viewport holds still during playback
+  function computeBounds(plotW, plotH) {
+    const out = {};
+    ['world', 'road'].forEach(function (mode) {
+      const k1 = mode === 'world' ? 'x' : 's', k2 = mode === 'world' ? 'y' : 't';
+      let lo1 = Infinity, hi1 = -Infinity, lo2 = Infinity, hi2 = -Infinity;
+      function consider(arr1, arr2) {
+        for (let i = 0; i < arr1.length; i++) {
+          if (arr1[i] < lo1) lo1 = arr1[i]; if (arr1[i] > hi1) hi1 = arr1[i];
+          if (arr2[i] < lo2) lo2 = arr2[i]; if (arr2[i] > hi2) hi2 = arr2[i];
+        }
+      }
+      data.frames.forEach(function (f) {
+        f.samples.forEach(function (r) { consider(r[k1], r[k2]); });
+        ['center', 'left', 'right'].forEach(function (k) { consider(f.road[k][k1], f.road[k][k2]); });
+        if (f.car) { consider([f.car[k1]], [f.car[k2]]); }
+        f.obstacles.forEach(function (o) { consider([o[k1]], [o[k2]]); });
+      });
+      if (!isFinite(lo1)) { lo1 = 0; hi1 = 1; lo2 = 0; hi2 = 1; }
+      const pad1 = Math.max(1e-6, (hi1 - lo1) * 0.06), pad2 = Math.max(1e-6, (hi2 - lo2) * 0.10);
+      lo1 -= pad1; hi1 += pad1; lo2 -= pad2; hi2 += pad2;
+      if (mode === 'world') {
+        const span1 = hi1 - lo1, span2 = hi2 - lo2;
+        const scale = Math.min(plotW / span1, plotH / span2);
+        const mid1 = (lo1 + hi1) / 2, mid2 = (lo2 + hi2) / 2;
+        lo1 = mid1 - (plotW / scale) / 2; hi1 = mid1 + (plotW / scale) / 2;
+        lo2 = mid2 - (plotH / scale) / 2; hi2 = mid2 + (plotH / scale) / 2;
+      }
+      out[mode] = { lo1: lo1, hi1: hi1, lo2: lo2, hi2: hi2 };
+    });
+    return out;
+  }
+
+  function currentFrame() {
+    return data && data.frames.length ? data.frames[Math.min(playIndex, data.frames.length - 1)] : null;
+  }
+
+  // simple top-down "car" rectangle (see "just a rectangle okay too" task):
+  // rounded body + a lighter windshield-ish stripe near the front so the
+  // facing direction reads at a glance. angle=0 points along local +x
+  // (screen right / +s in road view / +world-x in world view).
+  function drawCarRect(cx, cy, angle, lengthPx, widthPx, fillColor) {
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(angle);
+    const halfL = lengthPx / 2, halfW = widthPx / 2, r = Math.min(halfW, 2.5);
+    ctx.beginPath();
+    ctx.moveTo(-halfL + r, -halfW);
+    ctx.lineTo(halfL - r, -halfW);
+    ctx.quadraticCurveTo(halfL, -halfW, halfL, -halfW + r);
+    ctx.lineTo(halfL, halfW - r);
+    ctx.quadraticCurveTo(halfL, halfW, halfL - r, halfW);
+    ctx.lineTo(-halfL + r, halfW);
+    ctx.quadraticCurveTo(-halfL, halfW, -halfL, halfW - r);
+    ctx.lineTo(-halfL, -halfW + r);
+    ctx.quadraticCurveTo(-halfL, -halfW, -halfL + r, -halfW);
+    ctx.closePath();
+    ctx.fillStyle = fillColor;
+    ctx.fill();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(0,0,0,0.3)';
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(halfL * 0.15, -halfW * 0.6);
+    ctx.lineTo(halfL * 0.65, -halfW * 0.3);
+    ctx.lineTo(halfL * 0.65, halfW * 0.3);
+    ctx.lineTo(halfL * 0.15, halfW * 0.6);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function render() {
+    if (!data) return;
+    const f = currentFrame();
+    if (!f) return;
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.parentElement.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const W = rect.width, H = rect.height;
+    const pad = { l: 46, r: 16, t: 16, b: 30 };
+    const plotW = W - pad.l - pad.r, plotH = H - pad.t - pad.b;
+
+    if (!bnds) bnds = computeBounds(plotW, plotH);
+
+    const surface = getComputedStyle(document.documentElement).getPropertyValue('--surface').trim();
+    const grid = getComputedStyle(document.documentElement).getPropertyValue('--grid').trim();
+    const axis = getComputedStyle(document.documentElement).getPropertyValue('--axis').trim();
+    const inkMuted = getComputedStyle(document.documentElement).getPropertyValue('--ink-muted').trim();
+    const inkPrimary = getComputedStyle(document.documentElement).getPropertyValue('--ink').trim();
+    const good = getComputedStyle(document.documentElement).getPropertyValue('--good').trim();
+    const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
+    const obstacleColor = getComputedStyle(document.documentElement).getPropertyValue('--obstacle').trim();
+    const roadSurface = getComputedStyle(document.documentElement).getPropertyValue('--road-surface').trim();
+
+    ctx.fillStyle = surface;
+    ctx.fillRect(0, 0, W, H);
+
+    const isWorld = viewFrame === 'world';
+    const k1 = isWorld ? 'x' : 's', k2 = isWorld ? 'y' : 't';
+    const b = bnds[viewFrame];
+    const span1 = b.hi1 - b.lo1, span2 = b.hi2 - b.lo2;
+
+    function X(v) { return pad.l + ((v - b.lo1) / span1) * plotW; }
+    function Y(v) { return pad.t + plotH - ((v - b.lo2) / span2) * plotH; }
+
+    // gridlines
+    ctx.strokeStyle = grid;
+    ctx.lineWidth = 1;
+    ctx.font = '11px system-ui, sans-serif';
+    ctx.fillStyle = inkMuted;
+    const gridLines = 5;
+    for (let i = 0; i <= gridLines; i++) {
+      const v = b.lo1 + (span1 * i) / gridLines;
+      const x = Math.round(X(v)) + 0.5;
+      ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, pad.t + plotH); ctx.stroke();
+      ctx.fillText(v.toFixed(0) + 'm', x - 12, pad.t + plotH + 18);
+    }
+    for (let i = 0; i <= 4; i++) {
+      const v = b.lo2 + (span2 * i) / 4;
+      const y = Math.round(Y(v)) + 0.5;
+      ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + plotW, y); ctx.stroke();
+      ctx.fillText(isWorld ? v.toFixed(0) : v.toFixed(1), 6, y + 3);
+    }
+
+    // filled pavement ribbon between the left/right boundary tracks - drawn
+    // from the STITCHED full road (data.roadFull, built once at load time),
+    // not this frame's local window, so it's a stable backdrop rather than
+    // something that shifts/resizes every frame during playback.
+    const road = data.roadFull;
+    if (road.left.s.length && road.right.s.length
+        && road.left.s.length === road.right.s.length) {
+      ctx.beginPath();
+      for (let i = 0; i < road.left[k1].length; i++) {
+        const x = X(road.left[k1][i]), y = Y(road.left[k2][i]);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      for (let i = road.right[k1].length - 1; i >= 0; i--) {
+        ctx.lineTo(X(road.right[k1][i]), Y(road.right[k2][i]));
+      }
+      ctx.closePath();
+      ctx.fillStyle = roadSurface;
+      ctx.fill();
+    }
+
+    // road reference: center dashed (lane center), left/right solid (edges)
+    function drawTrack(track, dashed) {
+      if (!track.s.length) return;
+      ctx.beginPath();
+      for (let i = 0; i < track[k1].length; i++) {
+        const x = X(track[k1][i]), y = Y(track[k2][i]);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.setLineDash(dashed ? [4, 4] : []);
+      ctx.strokeStyle = axis;
+      ctx.lineWidth = dashed ? 1.5 : 1.75;
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    drawTrack(road.left, false);
+    drawTrack(road.right, false);
+    drawTrack(road.center, true);
+
+    // sample paths for THIS frame, sorted so lower-cost draws under higher-cost
+    const costs = f.samples.map(function (r) { return r.cost; }).sort(function (a, b) { return a - b; });
+    function rankOf(cost) {
+      let lo = 0, hi = costs.length;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (costs[mid] < cost) lo = mid + 1; else hi = mid; }
+      return costs.length <= 1 ? 0 : lo / (costs.length - 1);
+    }
+
+    let best = f.samples[0];
+    f.samples.forEach(function (r) { if (r.cost < best.cost) best = r; });
+
+    const ordered = f.samples.slice().sort(function (a, b) { return a.cost - b.cost; }).reverse();
+    ordered.forEach(function (rec) {
+      if (rec === best) return;
+      ctx.beginPath();
+      for (let i = 0; i < rec[k1].length; i++) {
+        const x = X(rec[k1][i]), y = Y(rec[k2][i]);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = rampColor(rankOf(rec.cost));
+      ctx.globalAlpha = 0.55;
+      ctx.lineWidth = 1.25;
+      ctx.stroke();
+    });
+    ctx.globalAlpha = 1;
+
+    // best path on top
+    if (best) {
+      ctx.beginPath();
+      for (let i = 0; i < best[k1].length; i++) {
+        const x = X(best[k1][i]), y = Y(best[k2][i]);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = good;
+      ctx.lineWidth = 2.25;
+      ctx.stroke();
+    }
+
+    // faint trail of the car's own path across all frames up to now
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i <= playIndex && i < data.frames.length; i++) {
+      const c = data.frames[i].car;
+      if (!c) continue;
+      const x = X(c[k1]), y = Y(c[k2]);
+      if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+    }
+    if (started) {
+      ctx.strokeStyle = inkPrimary;
+      ctx.globalAlpha = 0.35;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // obstacle markers: simple top-down "car" rectangles, sized to real
+    // radius in world view (equal-aspect, so real size is meaningful), a
+    // fixed small size in road view (non-equal-aspect makes true scale
+    // meaningless there). Oriented along the road's local tangent in world
+    // view - obstacles don't carry their own heading in the export, so
+    // this assumes they're roughly aligned with the road, a reasonable
+    // default for traffic in these scenarios.
+    const worldScale = plotW / span1; // px per meter, world view only
+    f.obstacles.forEach(function (o) {
+      const ox = X(o[k1]), oy = Y(o[k2]);
+      const length = isWorld ? Math.max(10, o.radius * 2.4 * worldScale) : 16;
+      const width = isWorld ? Math.max(6, o.radius * 1.2 * worldScale) : 8;
+      const angle = isWorld ? -roadHeadingAt(o.s) : 0;
+      ctx.globalAlpha = o.carried ? 0.4 : 1;
+      drawCarRect(ox, oy, angle, length, width, obstacleColor);
+      ctx.globalAlpha = 1;
+    });
+
+    // ego car marker: same rectangle shape, oriented by its real yaw in
+    // world view, axis-aligned in road view (forward is always +s there)
+    if (f.car) {
+      const cx = X(f.car[k1]), cy = Y(f.car[k2]);
+      const angle = isWorld ? -f.car.yaw : 0; // canvas y grows downward; world y is up, so negate
+      const length = isWorld ? Math.max(12, 4.3 * worldScale) : 18;
+      const width = isWorld ? Math.max(7, 1.8 * worldScale) : 9;
+      drawCarRect(cx, cy, angle, length, width, accent);
+    }
+
+    canvas._geom = { X: X, Y: Y, k1: k1, k2: k2, rankOf: rankOf, best: best, samples: f.samples };
+  }
+
+  function updateLegend() {
+    const f = currentFrame();
+    if (!f) return;
+    legendEl.hidden = false;
+    const steps = isDark() ? RAMP_LIGHT.slice().reverse() : RAMP_LIGHT;
+    const colors = steps.map(function (s) { return getComputedStyle(document.documentElement).getPropertyValue('--' + s).trim(); });
+    rampEl.style.background = 'linear-gradient(to top, ' + colors.join(',') + ')';
+    const costs = f.samples.map(function (r) { return r.cost; });
+    document.getElementById('legendLo').textContent = fmt(Math.min.apply(null, costs));
+    document.getElementById('legendHi').textContent = fmt(Math.max.apply(null, costs));
+  }
+
+  function updateStats() {
+    const f = currentFrame();
+    if (!f) return;
+    const costs = f.samples.map(function (r) { return r.cost; });
+    const best = Math.min.apply(null, costs);
+    const worst = Math.max.apply(null, costs);
+    statsEl.hidden = false;
+    statsEl.innerHTML =
+      '<div class="stat"><span>frames</span><b>' + data.frames.length + '</b></div>' +
+      '<div class="stat"><span>samples/frame</span><b>' + f.samples.length + '</b></div>' +
+      '<div class="stat"><span>horizon</span><b>' + (f.samples[0] ? f.samples[0].s.length : 0) + '</b><span>steps</span></div>' +
+      '<div class="stat"><span>best cost</span><b>' + fmt(best) + '</b></div>' +
+      '<div class="stat"><span>worst cost</span><b>' + fmt(worst) + '</b></div>' +
+      '<div class="stat"><span>lane limits</span><b>' + fmt(data.meta.left_limit, 2) + ' / -' + fmt(data.meta.right_limit, 2) + '</b><span>m</span></div>';
+    frameLabel.textContent = 'frame ' + (playIndex + 1) + ' / ' + data.frames.length + ' · t=' + f.simTime.toFixed(2) + 's';
+  }
+
+  function refresh() {
+    updateStats();
+    updateLegend();
+    render();
+  }
+
+  function setPlayIndex(i) {
+    if (!data || !data.frames.length) return;
+    playIndex = Math.max(0, Math.min(data.frames.length - 1, i));
+    scrub.value = String(playIndex);
+    refresh();
+  }
+
+  function stopPlaying() {
+    playing = false;
+    if (playTimer) { clearInterval(playTimer); playTimer = null; }
+    playIcon.style.display = '';
+    pauseIcon.style.display = 'none';
+    playBtn.setAttribute('aria-label', 'Play');
+  }
+
+  function startPlaying() {
+    if (!data || data.frames.length < 2) return;
+    playing = true;
+    playIcon.style.display = 'none';
+    pauseIcon.style.display = '';
+    playBtn.setAttribute('aria-label', 'Pause');
+    playTimer = setInterval(function () {
+      if (playIndex >= data.frames.length - 1) { setPlayIndex(0); return; }
+      setPlayIndex(playIndex + 1);
+    }, 260);
+  }
+
+  function loadText(text, filename) {
+    stopPlaying();
+    data = parseCSV(text);
+    bnds = null;
+    playIndex = 0;
+    emptyEl.hidden = true;
+    playbar.hidden = data.frames.length < 2;
+    scrub.max = String(Math.max(0, data.frames.length - 1));
+    scrub.value = '0';
+    fileBtnLabel.textContent = filename || 'Reload CSV';
+    refresh();
+  }
+
+  fileInput.addEventListener('change', function (e) {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = function () { loadText(reader.result, f.name); };
+    reader.readAsText(f);
+  });
+
+  frameToggle.addEventListener('click', function (e) {
+    const btn = e.target.closest('button[data-frame]');
+    if (!btn) return;
+    viewFrame = btn.dataset.frame;
+    frameToggle.querySelectorAll('button').forEach(function (b) {
+      b.setAttribute('aria-pressed', String(b === btn));
+    });
+    render();
+  });
+
+  playBtn.addEventListener('click', function () {
+    if (playing) stopPlaying(); else startPlaying();
+  });
+  scrub.addEventListener('input', function () {
+    stopPlaying();
+    setPlayIndex(parseInt(scrub.value, 10) || 0);
+  });
+
+  window.addEventListener('resize', function () { bnds = null; render(); });
+  const mq = window.matchMedia('(prefers-color-scheme: dark)');
+  if (mq.addEventListener) mq.addEventListener('change', function () { updateLegend(); render(); });
+  new MutationObserver(function () { updateLegend(); render(); })
+    .observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+  canvas.addEventListener('mousemove', function (e) {
+    if (!data || !canvas._geom) return;
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    const geom = canvas._geom;
+    let bestRec = null, bestDist = Infinity;
+    geom.samples.forEach(function (rec) {
+      for (let i = 0; i < rec[geom.k1].length; i++) {
+        const x = geom.X(rec[geom.k1][i]), y = geom.Y(rec[geom.k2][i]);
+        const d = (x - mx) * (x - mx) + (y - my) * (y - my);
+        if (d < bestDist) { bestDist = d; bestRec = rec; }
+      }
+    });
+    if (bestRec && bestDist < 20 * 20) {
+      const rank = geom.rankOf(bestRec.cost);
+      tooltip.style.opacity = 1;
+      tooltip.style.left = mx + 'px';
+      tooltip.style.top = my + 'px';
+      const isBest = bestRec === geom.best;
+      tooltip.innerHTML = (isBest ? '<b style="color:#3ecf3e">lowest cost</b><br/>' : '') +
+        'sample ' + bestRec.sample + '<br/>cost <b>' + fmt(bestRec.cost) + '</b> · rank ' + (rank * 100).toFixed(0) + '%';
+    } else {
+      tooltip.style.opacity = 0;
+    }
+  });
+  canvas.addEventListener('mouseleave', function () { tooltip.style.opacity = 0; });
+})();
+</script>

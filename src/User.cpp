@@ -71,6 +71,7 @@
 # include <windows.h>
 #endif
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -192,6 +193,32 @@ double
 NearestObstacleDy()
 {
     return SensorObstacleCount > 0 ? SensorObstacles[0].dy : 0.0;
+}
+
+/* FIX ("wrong side swerve" task): obstacle.dx/dy are in the vehicle's own
+   heading-aligned SENSOR frame (Object Sensor NearPnt.ds), not the road
+   frame - they must be rotated by the ego's heading-relative-to-road at
+   capture time (SensorObstacleReferenceHeading) before being added onto the
+   road-frame reference position. Previously this was a plain, un-rotated
+   add, which is only correct when the vehicle points exactly down the road
+   tangent; any heading offset (mid avoidance maneuver, or just a curve)
+   shifted the obstacle's computed road-frame position, sometimes making the
+   real gap look like it was on the wrong side. Factored out so both
+   ObstacleCost() and AnyCollisionRiskSensed() (see its lateral corridor
+   gate below) can report/reason about the same resolved position, and so
+   the diagnostic log can show it too instead of only the raw sensor
+   dx/dy. */
+void
+ObstacleAbsolutePosition(const Obstacle &obstacle, double &roadPosition, double &lateralPosition)
+{
+    const double cosReferenceHeading = cos(SensorObstacleReferenceHeading);
+    const double sinReferenceHeading = sin(SensorObstacleReferenceHeading);
+    const double obstacleRoadOffset =
+        obstacle.dx * cosReferenceHeading - obstacle.dy * sinReferenceHeading;
+    const double obstacleLateralOffset =
+        obstacle.dx * sinReferenceHeading + obstacle.dy * cosReferenceHeading;
+    roadPosition = SensorObstacleReferenceRoadDistance + obstacleRoadOffset;
+    lateralPosition = SensorObstacleReferenceLateralPosition + obstacleLateralOffset;
 }
 
 constexpr double SteeringLimit = 15.0 * Pi / 180.0;      /* steering-wheel angle [rad] */
@@ -335,6 +362,25 @@ WrapAngle(double angle)
    finish the job. */
 constexpr double CollisionRiskTimeToCollision = 4.0;
 
+/* Rollout visualization playback (see "animation... shows the car moving,
+   and all the sampled paths" task). Every RolloutCaptureInterval seconds
+   while MPPI is actually engaged, one frame (all 256 sampled paths + the
+   vehicle's own position) is appended to the rollout CSV, instead of the
+   earlier one-shot single snapshot. MaxRolloutFrames is a hard cap so a
+   long maneuver can't grow the file without bound; capture just stops past
+   that point (logged, not silent) rather than slowing the sim down. */
+constexpr double RolloutCaptureInterval = 0.5; /* [s] */
+constexpr int MaxRolloutFrames = 240;          /* 120 s of capture at the interval above */
+
+/* FIX ("MPPI kicks in on a 90-degree turn for an obstacle that isn't
+   really in the way" task): generous buffer beyond the current lane/
+   corridor's own edges (CurrentLeftRoadLimit/CurrentRightRoadLimit) used by
+   the TTC gate below. Wide enough to still catch an obstacle sitting just
+   off the lane edge (partially on the shoulder, sensor noise, etc.), but
+   nowhere near wide enough to catch something that's actually on a
+   different road segment entirely (e.g. around a sharp corner). */
+constexpr double CollisionRiskLateralCorridorMargin = 2.0; /* [m] */
+
 /* "Senses collision" gate (see doc/PROJECT_CONTEXT.md "only override on
    sensed collision" / "detection too late at high speed" tasks). Two
    checks, either one triggers:
@@ -342,27 +388,32 @@ constexpr double CollisionRiskTimeToCollision = 4.0;
       (dx, dy) falls inside the same normalized avoidance envelope
       ObstacleCost() itself treats as its "penetration zone"
       (normalizedDistanceSquared < 1.0) - a fixed geometric danger zone,
-      correct at any speed.
+      correct at any speed. Left un-gated by corridor width deliberately:
+      by the time an object is this close in the raw sensor frame, it's a
+      real, immediate risk regardless of road geometry.
    2. Speed-aware: time-to-collision (dx / speed) is under
       CollisionRiskTimeToCollision. A FIXED distance alone gives less and
       less warning time as speed increases - at 25 m and 10 m/s that's
       2.5 s of warning, but at 40 m/s it's under 0.6 s ("swerving too
       late"). This makes the trigger distance grow with speed instead of
       staying fixed.
-      NOTE: deliberately no lateral gate on this branch (tried one first,
-      `|dy| < obstacle.radius`, and removed it - see doc/PROJECT_CONTEXT.md
-      "circle path avoidance failure" task). On a curving road, obstacle.dy
-      is the RAW sensor-frame offset, which stays large right up until the
-      vehicle's heading actually swings to face the object - observed on
-      the circle track: dy=9.3 m, then 2.5 m, both still "off to the side"
-      by that gate, and it only triggered at dx=2.5 m (already almost on
-      top of it). Triggering on time-to-collision alone, regardless of
-      current dy, means MPPI also runs for some genuinely-irrelevant
-      off-to-the-side objects, but its own ObstacleCost() already discounts
-      those to near-zero once it runs (confirmed on the expressway
-      scenario: dy=75-94 m objects produced ~0 delta even while engaged) -
-      the extra rollout compute is a smaller cost than missing a real
-      curve-ahead threat. */
+      FIX ("90-degree turn" task): this branch used to have NO lateral
+      gate at all (tried the RAW `|dy| < obstacle.radius` gate first, and
+      removed it - see doc/PROJECT_CONTEXT.md "circle path avoidance
+      failure" task - because on a curving road obstacle.dy in the
+      vehicle's own current-heading sensor frame stays large right up
+      until the vehicle's heading swings to face the object, so that gate
+      missed real curve-ahead threats). The fix here is not to remove the
+      gate again, but to gate on the ROAD-FRAME position instead of the
+      raw sensor-frame one: ObstacleAbsolutePosition() already rotates
+      dx/dy by the current heading-relative-to-road, so an object dead
+      ahead on a gently curving road (where heading tracks the curve
+      fairly closely) still reads as "in the corridor" and triggers, while
+      an object that's actually around a sharp 90-degree corner - whose
+      raw dx looks close only because it's a straight-line distance
+      through open space, not along the road - resolves to a road-frame
+      lateral position tens of meters outside the current lane, and
+      correctly does NOT trigger. */
 bool
 AnyCollisionRiskSensed(double speed)
 {
@@ -381,7 +432,15 @@ AnyCollisionRiskSensed(double speed)
         }
         if (speed > 0.1 && obstacle.dx > 0.0
             && obstacle.dx / speed < CollisionRiskTimeToCollision) {
-            return true;
+            double obstacleRoadDistance;
+            double obstacleLateralPosition;
+            ObstacleAbsolutePosition(obstacle, obstacleRoadDistance, obstacleLateralPosition);
+            const double corridorLimit = (obstacleLateralPosition >= 0.0
+                ? CurrentLeftRoadLimit : CurrentRightRoadLimit)
+                + CollisionRiskLateralCorridorMargin;
+            if (fabs(obstacleLateralPosition) < corridorLimit) {
+                return true;
+            }
         }
     }
     return false;
@@ -411,32 +470,6 @@ NeedsMppiEngagement(double speed, double lateralPosition)
         return true;
     }
     return fabs(lateralPosition) > MppiReconvergenceLateralTolerance;
-}
-
-/* FIX ("wrong side swerve" task): obstacle.dx/dy are in the vehicle's own
-   heading-aligned SENSOR frame (Object Sensor NearPnt.ds), not the road
-   frame - they must be rotated by the ego's heading-relative-to-road at
-   capture time (SensorObstacleReferenceHeading) before being added onto the
-   road-frame reference position. Previously this was a plain, un-rotated
-   add, which is only correct when the vehicle points exactly down the road
-   tangent; any heading offset (mid avoidance maneuver, or just a curve)
-   shifted the obstacle's computed road-frame position, sometimes making the
-   real gap look like it was on the wrong side. Factored out of
-   ObstacleCost() so the diagnostic log below can report the same resolved
-   position MPPI actually reasons about, instead of only the raw sensor
-   dx/dy - needed to settle "why did it swerve toward that side" questions
-   from the log alone instead of guessing. */
-void
-ObstacleAbsolutePosition(const Obstacle &obstacle, double &roadPosition, double &lateralPosition)
-{
-    const double cosReferenceHeading = cos(SensorObstacleReferenceHeading);
-    const double sinReferenceHeading = sin(SensorObstacleReferenceHeading);
-    const double obstacleRoadOffset =
-        obstacle.dx * cosReferenceHeading - obstacle.dy * sinReferenceHeading;
-    const double obstacleLateralOffset =
-        obstacle.dx * sinReferenceHeading + obstacle.dy * cosReferenceHeading;
-    roadPosition = SensorObstacleReferenceRoadDistance + obstacleRoadOffset;
-    lateralPosition = SensorObstacleReferenceLateralPosition + obstacleLateralOffset;
 }
 
 double
@@ -546,6 +579,35 @@ RoadCurvature(double roadDistance, double lateralPosition)
     return rOut.curveXY;
 }
 
+/* Converts a (roadDistance, lateralPosition) rollout point into global (x, y)
+   - see SteeringMppi::AppendRolloutFrame() below ("doesn't look like the
+   actual path" task). Everything MPPI reasons about internally is in
+   road-frame (s, t): s is arc length along the route, t is lateral offset
+   from lane center. That's the right frame for cost/control math, but
+   plotting s/t directly only looks like the real path on a dead-straight
+   road - on any curve, s/t is a "straightened out" view where the road
+   itself is always a flat horizontal line, so a real curving maneuver
+   looks nothing like what the car actually traces on the ground. Global
+   (x, y) is what actually matches the driving screen. */
+void
+WorldPositionAt(double roadDistance, double lateralPosition, double &worldX, double &worldY)
+{
+    worldX = 0.0;
+    worldY = 0.0;
+    if (MppiRoadEval == nullptr) {
+        return;
+    }
+    tRoadRouteIn rIn{};
+    tRoadRouteOut rOut{};
+    rIn.st[0] = RoadEvaluationSOffset + roadDistance;
+    rIn.st[1] = lateralPosition;
+    if (RoadRouteEval(MppiRoadEval, nullptr, RIT_ST, &rIn, &rOut) == ROAD_Ok
+        && std::isfinite(rOut.xyz[0]) && std::isfinite(rOut.xyz[1])) {
+        worldX = rOut.xyz[0];
+        worldY = rOut.xyz[1];
+    }
+}
+
 struct MppiResult {
     double Command;
     double BestCost;
@@ -618,6 +680,9 @@ public:
                     + speed / MppiWheelbase * tan(frontWheelAngle) * MppiStep
                     - roadCurvature * stepDistance);
 
+                SampleRoadDistance[sample][step] = predictedDistance;
+                SampleLateralPosition[sample][step] = predictedLateralPosition;
+
                 const double lateralError = -predictedLateralPosition;
                 const double headingError = WrapAngle(-predictedHeading);
                 const double controlChange = steering - previousControl;
@@ -679,9 +744,120 @@ public:
         return {command, minimumCost, std::isfinite(command)};
     }
 
+    /* Rollout visualization playback (see "animation... shows the car
+       moving, and all the sampled paths" task): appends one FRAME - every
+       sample's full predicted path plus its total cost from the MOST
+       RECENT Update() call, plus the vehicle's own current position/
+       heading - to a growing CSV. Called at most every
+       RolloutCaptureInterval seconds while MPPI is engaged (throttled from
+       User_DrivMan_Calc), not every 20 Hz cycle - that would produce an
+       unusable amount of data. frameIndex == 0 (re)creates the file so a
+       new run doesn't inherit a previous run's frames; every later frame
+       appends.
+       Each point is written in BOTH frames: (s, t) is road-frame (arc
+       length, lateral offset) - the frame MPPI's cost function actually
+       reasons in - and (x, y) is global world coordinates via
+       WorldPositionAt(), which is what actually matches the driving
+       screen's shape on a curving road (see "doesn't look like the actual
+       path" task: s/t alone renders any curve as a flat line). Also emits
+       a road-shape reference (kind=R: center/left/right) spanning the same
+       s-range the samples reached, so the viewer can draw the real road
+       geometry behind the paths for context; a single kind=F row carrying
+       the vehicle's own world position/heading for that frame (sample
+       field repurposed to "car", cost field repurposed to sim time); and
+       one kind=O row per currently-tracked obstacle (sample field
+       repurposed to its object id, cost field repurposed to its radius) -
+       all sharing one flat table instead of several files to keep in
+       sync. */
+    void
+    AppendRolloutFrame(const char *path, int frameIndex, double simTime,
+                       double originRoadDistance, double originLateralPosition,
+                       double leftLimit, double rightLimit,
+                       double vehicleWorldX, double vehicleWorldY, double vehicleYaw) const
+    {
+        FILE *file = fopen(path, frameIndex == 0 ? "w" : "a");
+        if (file == nullptr) {
+            return;
+        }
+        if (frameIndex == 0) {
+            fprintf(file,
+                "# left_limit=%.6f right_limit=%.6f horizon=%d samples=%d "
+                "capture_interval=%.3f\n",
+                leftLimit, rightLimit, MppiHorizon, MppiSamples, RolloutCaptureInterval);
+            fprintf(file, "kind,sample,cost,step,s,t,x,y,frame,yaw\n");
+        }
+
+        fprintf(file, "F,car,%.6f,0,%.6f,%.6f,%.6f,%.6f,%d,%.6f\n",
+            simTime, originRoadDistance, originLateralPosition,
+            vehicleWorldX, vehicleWorldY, frameIndex, vehicleYaw);
+
+        double minRoadDistance = originRoadDistance;
+        double maxRoadDistance = originRoadDistance;
+        for (int sample = 0; sample < MppiSamples; ++sample) {
+            for (int step = 0; step < MppiHorizon; ++step) {
+                minRoadDistance = fmin(minRoadDistance, SampleRoadDistance[sample][step]);
+                maxRoadDistance = fmax(maxRoadDistance, SampleRoadDistance[sample][step]);
+            }
+        }
+
+        /* Obstacle markers (see "add ... the obstacle where it is" task):
+           cost field is repurposed to carry the obstacle's radius (for
+           drawing it at roughly the right size), same one-flat-table
+           reasoning as the F row above. */
+        for (int i = 0; i < SensorObstacleCount; ++i) {
+            const Obstacle &obstacle = SensorObstacles[i];
+            if (!obstacle.valid) {
+                continue;
+            }
+            double obstacleRoadDistance;
+            double obstacleLateralPosition;
+            ObstacleAbsolutePosition(obstacle, obstacleRoadDistance, obstacleLateralPosition);
+            minRoadDistance = fmin(minRoadDistance, obstacleRoadDistance);
+            maxRoadDistance = fmax(maxRoadDistance, obstacleRoadDistance);
+            double obstacleWorldX;
+            double obstacleWorldY;
+            WorldPositionAt(obstacleRoadDistance, obstacleLateralPosition, obstacleWorldX, obstacleWorldY);
+            fprintf(file, "O,%d,%.6f,0,%.6f,%.6f,%.6f,%.6f,%d,0\n",
+                obstacle.objId, obstacle.radius, obstacleRoadDistance, obstacleLateralPosition,
+                obstacleWorldX, obstacleWorldY, frameIndex);
+        }
+
+        for (int sample = 0; sample < MppiSamples; ++sample) {
+            for (int step = 0; step < MppiHorizon; ++step) {
+                const double s = SampleRoadDistance[sample][step];
+                const double t = SampleLateralPosition[sample][step];
+                double worldX;
+                double worldY;
+                WorldPositionAt(s, t, worldX, worldY);
+                fprintf(file, "S,%d,%.6f,%d,%.6f,%.6f,%.6f,%.6f,%d,0\n",
+                    sample, Costs[sample], step, s, t, worldX, worldY, frameIndex);
+            }
+        }
+
+        constexpr int ReferencePoints = 60;
+        const double referenceSpan = fmax(1.0, maxRoadDistance - minRoadDistance);
+        const char *referenceKinds[3] = {"center", "left", "right"};
+        const double referenceLateralPositions[3] = {0.0, leftLimit, -rightLimit};
+        for (int i = 0; i < ReferencePoints; ++i) {
+            const double s = minRoadDistance + referenceSpan * i / (ReferencePoints - 1);
+            for (int side = 0; side < 3; ++side) {
+                double worldX;
+                double worldY;
+                WorldPositionAt(s, referenceLateralPositions[side], worldX, worldY);
+                fprintf(file, "R,%s,0,%d,%.6f,%.6f,%.6f,%.6f,%d,0\n",
+                    referenceKinds[side], i, s, referenceLateralPositions[side],
+                    worldX, worldY, frameIndex);
+            }
+        }
+
+        fclose(file);
+    }
+
 private:
     std::array<double, MppiHorizon> NominalControl;
     std::array<std::array<double, MppiHorizon>, MppiSamples> Noise;
+    std::array<std::array<double, MppiHorizon>, MppiSamples> SampleRoadDistance;
+    std::array<std::array<double, MppiHorizon>, MppiSamples> SampleLateralPosition;
     std::array<double, MppiSamples> Costs;
     std::array<double, MppiSamples> Weights;
     std::mt19937 RandomGenerator;
@@ -1257,6 +1433,14 @@ User_DrivMan_Calc(double dt)
     static bool stalledBaselineCaptured = false;
     static double stalledBaselineSteering = 0.0;
     static unsigned int logCounter = 0;
+    /* Rollout visualization playback - see SteeringMppi::AppendRolloutFrame()
+       and the "animation... shows the car moving" task. Frame 0 captures
+       immediately on first engagement; later frames are throttled to
+       RolloutCaptureInterval by rolloutCaptureTimer, and capture stops
+       once rolloutFrameIndex reaches MaxRolloutFrames. */
+    static double rolloutCaptureTimer = 0.0;
+    static int rolloutFrameIndex = 0;
+    static bool rolloutCapWarned = false;
 
     /* Rely on the Vehicle Operator within DrivMan module to get
        the vehicle in driving state using the IPG's
@@ -1277,6 +1461,9 @@ User_DrivMan_Calc(double dt)
         stalledBaselineSteering = 0.0;
         mppiController.Reset();
         logCounter = 0;
+        rolloutCaptureTimer = 0.0;
+        rolloutFrameIndex = 0;
+        rolloutCapWarned = false;
         User.Out[0] = 0.0;
         User.Out[1] = Vehicle.Road.Path.tRoad;
         User.Out[2] = -Vehicle.Road.Path.tRoad;
@@ -1355,6 +1542,7 @@ User_DrivMan_Calc(double dt)
            doesn't even run (saves the 256x60 rollout too). */
         if (NeedsMppiEngagement(vehicleSpeed, Vehicle.Road.Path.tRoad)) {
             mppiUpdateTimer += dt;
+            rolloutCaptureTimer += dt;
             if (mppiUpdateTimer >= MppiUpdatePeriod) {
                 const MppiResult result = mppiController.Update(
                     distanceFromControlStart, Vehicle.Road.Path.tRoad,
@@ -1376,6 +1564,24 @@ User_DrivMan_Calc(double dt)
                     hasLastValidMppiCommand = true;
                     lastValidMppiCommand = result.Command;
                     previousMppiDelta = result.Command;
+                }
+                if (result.Valid && rolloutFrameIndex < MaxRolloutFrames
+                    && (rolloutFrameIndex == 0 || rolloutCaptureTimer >= RolloutCaptureInterval)) {
+                    mppiController.AppendRolloutFrame(
+                        "Data/TestRun/.tmp_mppi_rollout.csv", rolloutFrameIndex, SimCore.Time,
+                        distanceFromControlStart, Vehicle.Road.Path.tRoad,
+                        CurrentLeftRoadLimit, CurrentRightRoadLimit,
+                        Vehicle.Fr1A.t_0[0], Vehicle.Fr1A.t_0[1], Vehicle.Yaw);
+                    rolloutCaptureTimer = 0.0;
+                    if (rolloutFrameIndex == 0) {
+                        Log("MPPI rollout capture started: "
+                            "Data/TestRun/.tmp_mppi_rollout.csv\n");
+                    }
+                    ++rolloutFrameIndex;
+                } else if (rolloutFrameIndex >= MaxRolloutFrames && !rolloutCapWarned) {
+                    Log("MPPI rollout capture stopped at %d frames "
+                        "(MaxRolloutFrames reached)\n", MaxRolloutFrames);
+                    rolloutCapWarned = true;
                 }
             }
             controllerMode = mppiValid ? ControllerMode::Mppi : ControllerMode::Fallback;
@@ -1542,7 +1748,7 @@ User_VehicleControl_Calc(double dt)
     static bool first = true;
 
     if (first) {
-        Log("BUILD STAMP: LANE_RELATIVE_RIGHT_RAILING_V23 (built %s %s)\n", __DATE__, __TIME__);
+        Log("BUILD STAMP: ROLLOUT_VIZ_OBSTACLES_V28 (built %s %s)\n", __DATE__, __TIME__);
         Log("User_VehicleControl_Calc() is running!");
         first = false;
     }
