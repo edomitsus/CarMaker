@@ -173,6 +173,16 @@
     text-align: right;
   }
   .playbar[hidden] { display: none; }
+  .speedControl {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: none;
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+  .speedControl input[type="range"] { width: 90px; accent-color: var(--accent); }
+  .speedControl b { color: var(--ink); font-variant-numeric: tabular-nums; min-width: 34px; }
 
   .stats {
     display: flex;
@@ -296,6 +306,11 @@
     </button>
     <input type="range" class="scrub" id="scrub" min="0" max="0" value="0" step="1" />
     <div class="frameLabel" id="frameLabel">frame 0 / 0 · t=0.00s</div>
+    <div class="speedControl">
+      <span>Speed</span>
+      <input type="range" id="speed" min="0.25" max="4" step="0.25" value="1" />
+      <b id="speedLabel">1.0x</b>
+    </div>
   </div>
 
   <div class="board">
@@ -354,6 +369,8 @@
   const pauseIcon = document.getElementById('pauseIcon');
   const scrub = document.getElementById('scrub');
   const frameLabel = document.getElementById('frameLabel');
+  const speedInput = document.getElementById('speed');
+  const speedLabel = document.getElementById('speedLabel');
 
   let data = null; // { meta, frames: [{frameIndex, simTime, car:{s,t,x,y,yaw}, samples:[...], road:{center,left,right}}] }
   let bnds = null; // precomputed global bounds, world + road, so viewport doesn't jump between frames
@@ -361,6 +378,8 @@
   let playIndex = 0;
   let playing = false;
   let playTimer = null;
+  const BASE_FRAME_MS = 260; // interval at 1.0x
+  let playSpeed = 1;
 
   function isDark() {
     const stamp = document.documentElement.getAttribute('data-theme');
@@ -406,10 +425,13 @@
       const kind = parts[0], sampleId = parts[1], cost = parseFloat(parts[2]);
       const s = parseFloat(parts[4]), t = parseFloat(parts[5]), x = parseFloat(parts[6]), y = parseFloat(parts[7]);
       const frameIdx = parseInt(parts[8], 10), yaw = parseFloat(parts[9]);
+      // roadYaw (11th column) is newer than the other columns - default to
+      // 0 (axis-aligned) for CSVs exported before it existed.
+      const roadYaw = parts.length > 10 ? parseFloat(parts[10]) : 0;
       const f = frameRec(frameIdx);
       if (kind === 'F') {
         f.simTime = cost;
-        f.car = { s: s, t: t, x: x, y: y, yaw: yaw };
+        f.car = { s: s, t: t, x: x, y: y, yaw: yaw, roadYaw: roadYaw };
         continue;
       }
       if (kind === 'R') {
@@ -724,32 +746,46 @@
       ctx.globalAlpha = 1;
     }
 
-    // obstacle markers: simple top-down "car" rectangles, sized to real
-    // radius in world view (equal-aspect, so real size is meaningful), a
-    // fixed small size in road view (non-equal-aspect makes true scale
-    // meaningless there). Oriented along the road's local tangent in world
-    // view - obstacles don't carry their own heading in the export, so
-    // this assumes they're roughly aligned with the road, a reasonable
-    // default for traffic in these scenarios.
-    const worldScale = plotW / span1; // px per meter, world view only
-    f.obstacles.forEach(function (o) {
-      const ox = X(o[k1]), oy = Y(o[k2]);
-      const length = isWorld ? Math.max(10, o.radius * 2.4 * worldScale) : 16;
-      const width = isWorld ? Math.max(6, o.radius * 1.2 * worldScale) : 8;
-      const angle = isWorld ? -roadHeadingAt(o.s) : 0;
-      ctx.globalAlpha = o.carried ? 0.4 : 1;
-      drawCarRect(ox, oy, angle, length, width, obstacleColor);
-      ctx.globalAlpha = 1;
-    });
-
-    // ego car marker: same rectangle shape, oriented by its real yaw in
-    // world view, axis-aligned in road view (forward is always +s there)
-    if (f.car) {
-      const cx = X(f.car[k1]), cy = Y(f.car[k2]);
-      const angle = isWorld ? -f.car.yaw : 0; // canvas y grows downward; world y is up, so negate
-      const length = isWorld ? Math.max(12, 4.3 * worldScale) : 18;
-      const width = isWorld ? Math.max(7, 1.8 * worldScale) : 9;
-      drawCarRect(cx, cy, angle, length, width, accent);
+    // obstacle/ego markers: to-scale rectangles in world view (equal-
+    // aspect, so a real length/width and a rotation both mean something
+    // there); simple dots in road-relative view instead - that view is
+    // deliberately non-equal-aspect (exaggerates lateral deviation), so a
+    // rotated, non-uniformly-scaled rectangle there is more misleading
+    // than informative. A dot just marks position/lane offset cleanly.
+    const scale1 = plotW / span1;
+    const scale2 = plotH / span2;
+    if (isWorld) {
+      f.obstacles.forEach(function (o) {
+        const ox = X(o[k1]), oy = Y(o[k2]);
+        const length = Math.max(10, o.radius * 2.4 * scale1);
+        const width = Math.max(6, o.radius * 1.2 * scale2);
+        const angle = -roadHeadingAt(o.s); // no heading in the export; assume road-aligned
+        ctx.globalAlpha = o.carried ? 0.4 : 1;
+        drawCarRect(ox, oy, angle, length, width, obstacleColor);
+        ctx.globalAlpha = 1;
+      });
+      if (f.car) {
+        const cx = X(f.car[k1]), cy = Y(f.car[k2]);
+        const angle = -f.car.yaw; // canvas y grows downward; world y is up, so negate
+        const length = Math.max(12, 4.3 * scale1);
+        const width = Math.max(7, 1.8 * scale2);
+        drawCarRect(cx, cy, angle, length, width, accent);
+      }
+    } else {
+      f.obstacles.forEach(function (o) {
+        ctx.beginPath();
+        ctx.arc(X(o[k1]), Y(o[k2]), 5, 0, Math.PI * 2);
+        ctx.fillStyle = obstacleColor;
+        ctx.globalAlpha = o.carried ? 0.4 : 1;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      });
+      if (f.car) {
+        ctx.beginPath();
+        ctx.arc(X(f.car[k1]), Y(f.car[k2]), 5, 0, Math.PI * 2);
+        ctx.fillStyle = accent;
+        ctx.fill();
+      }
     }
 
     canvas._geom = { X: X, Y: Y, k1: k1, k2: k2, rankOf: rankOf, best: best, samples: f.samples };
@@ -811,10 +847,11 @@
     playIcon.style.display = 'none';
     pauseIcon.style.display = '';
     playBtn.setAttribute('aria-label', 'Pause');
+    if (playTimer) clearInterval(playTimer);
     playTimer = setInterval(function () {
       if (playIndex >= data.frames.length - 1) { setPlayIndex(0); return; }
       setPlayIndex(playIndex + 1);
-    }, 260);
+    }, BASE_FRAME_MS / playSpeed);
   }
 
   function loadText(text, filename) {
@@ -854,6 +891,11 @@
   scrub.addEventListener('input', function () {
     stopPlaying();
     setPlayIndex(parseInt(scrub.value, 10) || 0);
+  });
+  speedInput.addEventListener('input', function () {
+    playSpeed = parseFloat(speedInput.value) || 1;
+    speedLabel.textContent = playSpeed.toFixed(2).replace(/\.?0+$/, '') + 'x';
+    if (playing) startPlaying(); // restart interval so the new rate applies immediately
   });
 
   window.addEventListener('resize', function () { bnds = null; render(); });

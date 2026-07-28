@@ -783,7 +783,8 @@ public:
     AppendRolloutFrame(const char *path, int frameIndex, double simTime,
                        double originRoadDistance, double originLateralPosition,
                        double leftLimit, double rightLimit,
-                       double vehicleWorldX, double vehicleWorldY, double vehicleYaw) const
+                       double vehicleWorldX, double vehicleWorldY, double vehicleYaw,
+                       double vehicleHeadingRelativeToRoad) const
     {
         FILE *file = fopen(path, frameIndex == 0 ? "w" : "a");
         if (file == nullptr) {
@@ -794,12 +795,19 @@ public:
                 "# left_limit=%.6f right_limit=%.6f horizon=%d samples=%d "
                 "capture_interval=%.3f\n",
                 leftLimit, rightLimit, MppiHorizon, MppiSamples, RolloutCaptureInterval);
-            fprintf(file, "kind,sample,cost,step,s,t,x,y,frame,yaw\n");
+            /* roadYaw (see "make the ego vehicle turn with the steering
+               too" task): heading relative to the ROAD tangent, not global
+               world yaw - what the "yaw" column already carries. In
+               road-relative (s,t) view, "forward" is always +s by
+               construction, so world yaw isn't the right angle to rotate
+               the ego marker by there; this is. Only meaningful on F
+               (vehicle) rows - 0 elsewhere. */
+            fprintf(file, "kind,sample,cost,step,s,t,x,y,frame,yaw,roadYaw\n");
         }
 
-        fprintf(file, "F,car,%.6f,0,%.6f,%.6f,%.6f,%.6f,%d,%.6f\n",
+        fprintf(file, "F,car,%.6f,0,%.6f,%.6f,%.6f,%.6f,%d,%.6f,%.6f\n",
             simTime, originRoadDistance, originLateralPosition,
-            vehicleWorldX, vehicleWorldY, frameIndex, vehicleYaw);
+            vehicleWorldX, vehicleWorldY, frameIndex, vehicleYaw, vehicleHeadingRelativeToRoad);
 
         double minRoadDistance = originRoadDistance;
         double maxRoadDistance = originRoadDistance;
@@ -827,7 +835,7 @@ public:
             double obstacleWorldX;
             double obstacleWorldY;
             WorldPositionAt(obstacleRoadDistance, obstacleLateralPosition, obstacleWorldX, obstacleWorldY);
-            fprintf(file, "O,%d,%.6f,0,%.6f,%.6f,%.6f,%.6f,%d,0\n",
+            fprintf(file, "O,%d,%.6f,0,%.6f,%.6f,%.6f,%.6f,%d,0,0\n",
                 obstacle.objId, obstacle.radius, obstacleRoadDistance, obstacleLateralPosition,
                 obstacleWorldX, obstacleWorldY, frameIndex);
         }
@@ -839,7 +847,7 @@ public:
                 double worldX;
                 double worldY;
                 WorldPositionAt(s, t, worldX, worldY);
-                fprintf(file, "S,%d,%.6f,%d,%.6f,%.6f,%.6f,%.6f,%d,0\n",
+                fprintf(file, "S,%d,%.6f,%d,%.6f,%.6f,%.6f,%.6f,%d,0,0\n",
                     sample, Costs[sample], step, s, t, worldX, worldY, frameIndex);
             }
         }
@@ -854,7 +862,7 @@ public:
                 double worldX;
                 double worldY;
                 WorldPositionAt(s, referenceLateralPositions[side], worldX, worldY);
-                fprintf(file, "R,%s,0,%d,%.6f,%.6f,%.6f,%.6f,%d,0\n",
+                fprintf(file, "R,%s,0,%d,%.6f,%.6f,%.6f,%.6f,%d,0,0\n",
                     referenceKinds[side], i, s, referenceLateralPositions[side],
                     worldX, worldY, frameIndex);
             }
@@ -1581,7 +1589,8 @@ User_DrivMan_Calc(double dt)
                         "Data/TestRun/.tmp_mppi_rollout.csv", rolloutFrameIndex, SimCore.Time,
                         distanceFromControlStart, Vehicle.Road.Path.tRoad,
                         CurrentLeftRoadLimit, CurrentRightRoadLimit,
-                        Vehicle.Fr1A.t_0[0], Vehicle.Fr1A.t_0[1], Vehicle.Yaw);
+                        Vehicle.Fr1A.t_0[0], Vehicle.Fr1A.t_0[1], Vehicle.Yaw,
+                        headingRelativeToRoad);
                     rolloutCaptureTimer = 0.0;
                     if (rolloutFrameIndex == 0) {
                         Log("MPPI rollout capture started: "
@@ -1758,7 +1767,7 @@ User_VehicleControl_Calc(double dt)
     static bool first = true;
 
     if (first) {
-        Log("BUILD STAMP: ROLLOUT_VIZ_DENSER_CAPTURE_V30 (built %s %s)\n", __DATE__, __TIME__);
+        Log("BUILD STAMP: ROLLOUT_VIZ_ROADYAW_V31 (built %s %s)\n", __DATE__, __TIME__);
         Log("User_VehicleControl_Calc() is running!");
         first = false;
     }
