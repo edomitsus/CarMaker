@@ -1,3 +1,15 @@
+<!--
+  This is the LOCAL-PREVIEW copy of the README. It's identical to README.md except the
+  Demos section uses plain relative paths (media/*.mp4), which play fine in a local
+  Markdown previewer (e.g. VS Code's built-in preview) but will NOT render as inline
+  video on github.com - GitHub's renderer only auto-plays videos uploaded through its
+  own asset pipeline (drag-and-drop into the GitHub web editor), not relative repo paths.
+
+  README.md is the GitHub-facing copy; once you've drag-and-dropped each video into the
+  GitHub editor and gotten back its https://github.com/.../assets/... link, that goes in
+  README.md instead. This file just stays as the always-working local version.
+-->
+
 # CarMaker Steering-Only MPPI Controller
 
 A Model Predictive Path Integral (MPPI) controller for obstacle avoidance in CarMaker Office,
@@ -11,19 +23,11 @@ All of the controller logic lives in [`src/User.cpp`](src/User.cpp).
 
 ## Demos
 
-<!--
-  GitHub only auto-plays videos uploaded through its own asset pipeline, not plain relative
-  paths to files committed in the repo. To fill these in: open this file in the GitHub web
-  editor (or a new issue/PR as scratch space), drag and drop each video from media/ into the
-  text box, and GitHub will upload it and generate a working
-  https://github.com/<user>/<repo>/assets/... embed - paste that in place of each placeholder
-  below. Until then, see README.local.md for a version with working local-relative-path
-  video tags (plays in VS Code's Markdown preview etc., not on github.com).
--->
+<!-- Local relative paths - open this file in a local Markdown previewer, not on github.com -->
 
 ### MPPI avoiding an obstacle
 
-*(video pending — see comment above)*
+<video src="media/default_view_web.mp4" controls width="720"></video>
 
 ### 2D visualization — sampled paths colored by cost
 
@@ -31,7 +35,8 @@ Every path MPPI considered on a given update, colored by rank so the cheapest (c
 stands out, replayed frame by frame as the car moves. Produced with
 [`tools/mppi_rollout_viewer.html`](tools/mppi_rollout_viewer.html).
 
-*(video pending — see comment above)*
+<video src="media/2DMPPI_world.mp4" controls width="720"></video>
+<video src="media/2DMPPI_road.mp4" controls width="720"></video>
 
 ### 3D visualization — sampled paths overlaid on real footage
 
@@ -39,13 +44,13 @@ The same sampled paths projected onto real MovieNX-recorded footage from a calib
 vehicle-fixed camera model, so you can see what MPPI was evaluating superimposed on the
 actual simulation video. Produced with [`mppi_video_overlay.html`](mppi_video_overlay.html).
 
-*(video pending — see comment above)*
+<video src="media/3DMPPI.mp4" controls width="720"></video>
 
 ### Simulator footage
 
 Raw CarMaker/MovieNX recording of the scenario, no overlay.
 
-*(video pending — see comment above)*
+<video src="media/UsT3R.mp4" controls width="720"></video>
 
 ---
 
