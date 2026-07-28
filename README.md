@@ -23,7 +23,7 @@ All of the controller logic lives in [`src/User.cpp`](src/User.cpp).
 
 ### MPPI avoiding an obstacle
 
-*(video pending — see comment above)*
+https://github.com/user-attachments/assets/f33931c4-5763-4505-a81b-6156df704a49
 
 ### 2D visualization — sampled paths colored by cost
 
@@ -31,7 +31,9 @@ Every path MPPI considered on a given update, colored by rank so the cheapest (c
 stands out, replayed frame by frame as the car moves. Produced with
 [`tools/mppi_rollout_viewer.html`](tools/mppi_rollout_viewer.html).
 
-*(video pending — see comment above)*
+https://github.com/user-attachments/assets/a34e817d-22f9-4362-b6df-a84ce06f7033
+
+https://github.com/user-attachments/assets/fd735cdc-72a4-4269-b3dc-d65d8786f446
 
 ### 3D visualization — sampled paths overlaid on real footage
 
@@ -39,13 +41,13 @@ The same sampled paths projected onto real MovieNX-recorded footage from a calib
 vehicle-fixed camera model, so you can see what MPPI was evaluating superimposed on the
 actual simulation video. Produced with [`mppi_video_overlay.html`](mppi_video_overlay.html).
 
-*(video pending — see comment above)*
+https://github.com/user-attachments/assets/384111d6-dbfe-4369-9708-09a7ca11c355
 
 ### Simulator footage
 
 Raw CarMaker/MovieNX recording of the scenario, no overlay.
 
-*(video pending — see comment above)*
+https://github.com/user-attachments/assets/894c2d08-a2d1-4a4f-ae1d-d699bcede4e0
 
 ---
 
