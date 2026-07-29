@@ -114,6 +114,16 @@ constexpr double ObstacleLateralRadius = 1.85;             /* avoidance envelope
 constexpr double PreferredPassingLateralPosition = 2.25;  /* deterministic left pass [m] */
 constexpr double RoadSafetyMargin = 1.0;                  /* edge approach margin [m] */
 constexpr double DefaultRoadWidth = 6.0;                  /* conservative eval fallback [m] */
+/* Junction/connector links in the road network can report a tiny placeholder
+   Act.Width (observed: 1.0 m) that describes the network node itself, not
+   the vehicle's actual navigable space while turning through the
+   intersection. Trusting that reading collapsed CurrentRightRoadLimit/
+   CurrentLeftRoadLimit to ~0.5 m mid-turn, which made the hard edge
+   guardrail (and RoadBoundaryCost) fire against a nonsense boundary instead
+   of the real one - see doc/PROJECT_CONTEXT.md "guardrail fires on junction
+   geometry" task. No real single lane is this narrow, so a reading below
+   this floor is treated as untrustworthy. */
+constexpr double MinimumPlausibleActWidth = 2.5;          /* [m] */
 /* Weights for RoadBoundaryCost() below (see doc/PROJECT_CONTEXT.md "road
    edge not punished enough" task). Old values (soft=500, hard=5000) were
    smaller than ObstacleCost()'s own max penetration cost (~10,250), so the
@@ -247,6 +257,45 @@ constexpr double MaxAbsoluteSteeringCommand = 720.0 * Pi / 180.0;
    any obstacle. It's meant to almost never fire if the cost-based tuning
    above is doing its job - it's the guarantee underneath the preference. */
 constexpr double RoadEdgeGuardrailMargin = 0.15; /* [m] trigger just inside the true edge */
+/* Dedicated steering authority for the guardrail override, deliberately
+   separate from MPPI's own SteeringLimit (+-15 deg, sized for a small
+   avoidance nudge on top of baseline). Reusing SteeringLimit here meant the
+   "last resort" override could be LESS authoritative than baseline's own
+   ordinary steering during a normal turn (observed: baseline commanding
+   -29.73 deg the instant before the guardrail took over and capped it down
+   to -15 deg) - so the guardrail engaged in time but still couldn't arrest
+   the excursion, being weaker than what was already failing. 45 deg
+   (matching the largest baseline angles seen during normal curve-tracking
+   elsewhere in these logs) is as far as this should go, though - a
+   follow-up attempt at 90 deg was tried to fix a still-unrecovered sharp
+   turn (baseline itself independently converging on ~-44.5 deg there and
+   still failing), but it broke the ORIGINAL, previously-working obstacle
+   pass instead: at a fixed EdgeGuardrailRampDistance, doubling the
+   authority doubles the correction per meter of excess, and during a
+   tight high-speed pass that's already mid-swerve, that stronger,
+   faster-ramping correction overshot through lane center and out the
+   OTHER side, crashing ~40s earlier than any previous run. More authority
+   fights an already-occurring avoidance maneuver instead of just raising
+   the ceiling for genuinely dire cases - back to 45 deg, which is the
+   largest value observed not to cause that. The still-unresolved sharp
+   turn needs a different fix than guardrail authority (see
+   doc/PROJECT_CONTEXT.md "vehicle carries too much speed into a tight
+   turn after a long stall" task). */
+constexpr double EdgeGuardrailSteeringLimit = 45.0 * Pi / 180.0; /* [rad] */
+/* FIX (observed: raising EdgeGuardrailSteeringLimit above fixed an
+   undershoot on a sharp turn, but caused a much worse failure elsewhere -
+   the guardrail used to snap straight to its full target the INSTANT
+   tRoad crossed the trigger margin, bang-bang style. During a tight
+   obstacle pass that's already mid-correction, that abrupt full-authority
+   yank overshot back through lane center and swung the vehicle all the
+   way into the OPPOSITE edge before the correction could reverse in time.
+   A bigger authority just made that overshoot bigger in both directions -
+   the bang-bang shape was the actual problem, not the magnitude. Ramping
+   the override from 0 at the trigger margin up to full
+   EdgeGuardrailSteeringLimit over this distance keeps it gentle right at
+   the threshold (where a hard yank isn't yet warranted) while still
+   reaching full authority if the excursion keeps getting worse. */
+constexpr double EdgeGuardrailRampDistance = 1.0; /* [m] */
 
 enum class SpeedState {
     Startup,
@@ -460,26 +509,74 @@ AnyCollisionRiskSensed(double speed)
    NeedsMppiEngagement() below. */
 constexpr double MppiReconvergenceLateralTolerance = 0.3; /* [m] */
 
-/* (see doc/PROJECT_CONTEXT.md "can't return to a curving route after
-   avoiding an obstacle" task). Previously MPPI engaged ONLY on sensed
-   collision risk; once the risk cleared, steering dropped straight to
-   PASSTHROUGH (baseline alone), so any lateral offset left over from the
-   avoidance swerve was entirely IPGDriver's own baseline's problem to fix.
-   On a straight road that's fine; on a curve, the baseline is
-   simultaneously tracking the ongoing curve AND trying to claw back a
-   real lateral error it wasn't necessarily designed to recover from
-   aggressively, and can lose that race - leaving the car parked at an
-   offset. Keeping MPPI engaged (with its own modest LaneCenterWeight pull,
-   now also curvature-aware) until the car is actually back near center,
-   not just until the collision risk clears, lets it help close that gap
-   instead of handing 100% of recovery to the baseline. */
+/* Whether MPPI is currently inside an obstacle-avoidance-and-return-to-route
+   episode - see NeedsMppiEngagement() below. Only ever set true by an
+   actually sensed collision risk, never by lateral position alone. A
+   generic lateral offset with no obstacle behind it (e.g. IPGDriver's own
+   baseline running wide on a sharp turn after a long stall - observed to
+   happen with MPPI correctly disengaged the whole time) is explicitly NOT
+   MPPI's problem to fix; IPGDriver's own steering is never overridden for
+   being merely off-center or close to the edge on its own (see
+   doc/PROJECT_CONTEXT.md "only trigger on an actual obstacle, not
+   proximity to the edge" task) - that's IPGDriver's job, full stop. The
+   separate hard EdgeGuardrail override below is unaffected by this; it's
+   a distinct last-resort safety net, not an MPPI engagement condition. */
+bool RecoveringFromObstacle = false;
+
+/* MPPI engages on a sensed collision risk (which also marks the start of a
+   recovery episode), OR - only while still inside that episode - until the
+   vehicle has reconverged to lane center. Once reconverged (or if no
+   episode is active at all), MPPI stays off regardless of how large
+   lateralPosition is; see the comment on RecoveringFromObstacle above for
+   why that's deliberate rather than an oversight. This is a state
+   transition, not a timer: unlike an earlier fixed grace-period attempt,
+   there's no arbitrary duration to tune - the episode ends exactly when
+   the car is actually back near center. Delta stacking on top of an
+   already-large baseline (the original reason for restricting this) is
+   handled separately below by MppiDeltaAuthorityScale(), not by narrowing
+   when MPPI is allowed to run. */
 bool
-NeedsMppiEngagement(double speed, double lateralPosition)
+NeedsMppiEngagement(double speed, double lateralPosition, double dt)
 {
+    (void)dt;
     if (AnyCollisionRiskSensed(speed)) {
+        RecoveringFromObstacle = true;
         return true;
     }
-    return fabs(lateralPosition) > MppiReconvergenceLateralTolerance;
+    if (RecoveringFromObstacle) {
+        if (fabs(lateralPosition) > MppiReconvergenceLateralTolerance) {
+            return true;
+        }
+        RecoveringFromObstacle = false;
+    }
+    return false;
+}
+
+/* See NeedsMppiEngagement() above - this is the actual fix for MPPI's delta
+   stacking on top of an already-large baseline command. Below
+   MppiDeltaAuthorityTaperStart, MPPI has its full +-SteeringLimit authority
+   (normal obstacle-avoidance case, baseline near lane-center). Above
+   MppiDeltaAuthorityTaperEnd, MPPI contributes nothing at all - baseline is
+   already committing serious steering angle to execute a turn on its own,
+   and adding more on top is how the vehicle ends up commanded well past
+   what it can physically track. In between, authority tapers linearly
+   rather than cutting off sharply, consistent with the smooth (not
+   cliff-edge) cost shaping used everywhere else in this file. */
+constexpr double MppiDeltaAuthorityTaperStart = 20.0 * Pi / 180.0; /* [rad] */
+constexpr double MppiDeltaAuthorityTaperEnd = 40.0 * Pi / 180.0;   /* [rad] */
+
+double
+MppiDeltaAuthorityScale(double baselineSteering)
+{
+    const double magnitude = fabs(baselineSteering);
+    if (magnitude <= MppiDeltaAuthorityTaperStart) {
+        return 1.0;
+    }
+    if (magnitude >= MppiDeltaAuthorityTaperEnd) {
+        return 0.0;
+    }
+    return (MppiDeltaAuthorityTaperEnd - magnitude)
+        / (MppiDeltaAuthorityTaperEnd - MppiDeltaAuthorityTaperStart);
 }
 
 double
@@ -1264,6 +1361,7 @@ User_TestRun_Start_atEnd(void)
     SensorObstacleReferenceHeading = 0.0;
     CurrentRightRoadLimit = 0.5 * DefaultRoadWidth;
     CurrentLeftRoadLimit = 0.5 * DefaultRoadWidth;
+    RecoveringFromObstacle = false;
 
     if (MountedObjectSensor == nullptr) {
         LogWarnF(EC_Init, "Object sensor '%s' was not found; continuing without sensor obstacle",
@@ -1519,6 +1617,16 @@ User_DrivMan_Calc(double dt)
         ? SpeedState::Startup
         : (vehicleSpeed < 1.0 ? SpeedState::Stalled : SpeedState::Moving);
     ControllerMode controllerMode = ControllerMode::Fallback;
+    /* Whether anything below is actually adding a correction on top of
+       (or in place of) IPGDriver's own steering this cycle - see the
+       steeringCommand computation at the bottom of this function. Only
+       true when MPPI has a valid delta, a real recovery correction is
+       being added, or the guardrail fires. False (the common case, no
+       obstacle nearby) means IPGDriver's own baseline is trusted
+       completely, with no rate/acceleration smoothing from us either -
+       see the "our own rate limiter was throttling raw IPGDriver output"
+       task in doc/PROJECT_CONTEXT.md. */
+    bool mppiIsActivelyCorrecting = false;
 
     const double distanceFromControlStart = controlReferenceInitialized
         ? Vehicle.sRoad - controlStartRoadPosition : 0.0;
@@ -1544,11 +1652,17 @@ User_DrivMan_Calc(double dt)
         const double actWidth = std::isfinite(Vehicle.Road.Act.Width)
                 && Vehicle.Road.Act.Width > 0.0
             ? Vehicle.Road.Act.Width : DefaultRoadWidth;
-        const double leftLaneWidth = std::isfinite(Vehicle.Road.OnLeft.Width)
-                && Vehicle.Road.OnLeft.Width > 0.0
-            ? Vehicle.Road.OnLeft.Width : 0.0;
-        CurrentRightRoadLimit = 0.5 * actWidth;
-        CurrentLeftRoadLimit = 0.5 * actWidth + leftLaneWidth;
+        if (actWidth >= MinimumPlausibleActWidth) {
+            const double leftLaneWidth = std::isfinite(Vehicle.Road.OnLeft.Width)
+                    && Vehicle.Road.OnLeft.Width > 0.0
+                ? Vehicle.Road.OnLeft.Width : 0.0;
+            CurrentRightRoadLimit = 0.5 * actWidth;
+            CurrentLeftRoadLimit = 0.5 * actWidth + leftLaneWidth;
+        }
+        /* else: implausibly narrow reading (see MinimumPlausibleActWidth
+           above) - hold last cycle's CurrentRightRoadLimit/
+           CurrentLeftRoadLimit rather than collapsing the guardrail and
+           RoadBoundaryCost limits to a junction-node placeholder width. */
     }
 
     if (speedState == SpeedState::Moving) {
@@ -1558,7 +1672,7 @@ User_DrivMan_Calc(double dt)
            "can't return to a curving route" tasks) - otherwise IPGDriver's
            own baseline passes straight through, untouched, and MPPI
            doesn't even run (saves the 256x60 rollout too). */
-        if (NeedsMppiEngagement(vehicleSpeed, Vehicle.Road.Path.tRoad)) {
+        if (NeedsMppiEngagement(vehicleSpeed, Vehicle.Road.Path.tRoad, dt)) {
             mppiUpdateTimer += dt;
             rolloutCaptureTimer += dt;
             if (mppiUpdateTimer >= MppiUpdatePeriod) {
@@ -1575,13 +1689,21 @@ User_DrivMan_Calc(double dt)
                    back to the baseline alone rather than a standalone
                    absolute correction - see the RECOVERY/FALLBACK fix below
                    for why (dropping the baseline entirely caused the vehicle
-                   to leave a curving road). */
+                   to leave a curving road). The delta is scaled by
+                   MppiDeltaAuthorityScale() (see NeedsMppiEngagement above)
+                   so it can't stack unchecked on top of a baseline that's
+                   already committing a large angle to execute a turn on its
+                   own; the scaled value (not the raw one) is what gets
+                   remembered for warm-starting and reconvergence bookkeeping
+                   since it's what was actually applied. */
+                const double scaledDelta = result.Command
+                    * MppiDeltaAuthorityScale(ipgBaselineSteering);
                 mppiRequestedSteering = result.Valid
-                    ? ipgBaselineSteering + result.Command : ipgBaselineSteering;
+                    ? ipgBaselineSteering + scaledDelta : ipgBaselineSteering;
                 if (result.Valid) {
                     hasLastValidMppiCommand = true;
-                    lastValidMppiCommand = result.Command;
-                    previousMppiDelta = result.Command;
+                    lastValidMppiCommand = scaledDelta;
+                    previousMppiDelta = scaledDelta;
                 }
                 if (result.Valid && rolloutFrameIndex < MaxRolloutFrames
                     && (rolloutFrameIndex == 0 || rolloutCaptureTimer >= RolloutCaptureInterval)) {
@@ -1604,6 +1726,7 @@ User_DrivMan_Calc(double dt)
                 }
             }
             controllerMode = mppiValid ? ControllerMode::Mppi : ControllerMode::Fallback;
+            mppiIsActivelyCorrecting = mppiValid;
         } else {
             mppiUpdateTimer = 0.0;
             mppiValid = false;
@@ -1611,6 +1734,7 @@ User_DrivMan_Calc(double dt)
             previousMppiDelta = 0.0;
             mppiRequestedSteering = ipgBaselineSteering;
             controllerMode = ControllerMode::Passthrough;
+            mppiIsActivelyCorrecting = false;
         }
         /* Not stalled right now: the next stall (if any) should snapshot a
            fresh baseline, not reuse a stale one from a previous episode
@@ -1629,15 +1753,38 @@ User_DrivMan_Calc(double dt)
            the baseline ONCE when the stall begins and hold that fixed
            value for the correction to sit on top of, instead of
            re-reading a value that includes everything we've already added
-           on previous stalled cycles. */
+           on previous stalled cycles.
+
+           That freeze is only actually needed while a nonzero correction is
+           being added on top every cycle - that's the specific thing that
+           integrates. A stall with nothing to recover from (no residual
+           obstacle-avoidance memory, e.g. waiting at a traffic light well
+           after the reconvergence grace period has lapsed) doesn't need it:
+           passing the live baseline straight through adds nothing per
+           cycle, so it can't run away either. Freezing it anyway in that
+           case was denying IPGDriver's own steering law any chance to keep
+           adjusting while stopped (observed: a ~30s light stop right before
+           a sharp turn held the frozen pre-stop angle the whole time, then
+           had to snap ~8 degrees larger all at once the instant motion
+           resumed, which the vehicle couldn't track without running wide -
+           see doc/PROJECT_CONTEXT.md "baseline diverges from default driver
+           after a long stall" task). */
         mppiValid = false;
-        if (!stalledBaselineCaptured) {
-            stalledBaselineSteering = ipgBaselineSteering;
-            stalledBaselineCaptured = true;
-        }
         const double recoverySource = hasLastValidMppiCommand ? lastValidMppiCommand : 0.0;
-        mppiRequestedSteering = stalledBaselineSteering + Clamp(
+        const double recoveryCorrection = Clamp(
             recoverySource, -RecoverySteeringLimit, RecoverySteeringLimit);
+        if (fabs(recoveryCorrection) > 1.0e-9) {
+            if (!stalledBaselineCaptured) {
+                stalledBaselineSteering = ipgBaselineSteering;
+                stalledBaselineCaptured = true;
+            }
+            mppiRequestedSteering = stalledBaselineSteering + recoveryCorrection;
+            mppiIsActivelyCorrecting = true;
+        } else {
+            stalledBaselineCaptured = false;
+            mppiRequestedSteering = ipgBaselineSteering;
+            mppiIsActivelyCorrecting = false;
+        }
         controllerMode = ControllerMode::Recovery;
     } else {
         /* STARTUP: no MPPI delta computed yet - baseline alone. */
@@ -1653,23 +1800,60 @@ User_DrivMan_Calc(double dt)
        actuator smoothing. Positive tRoad is left (see
        PreferredPassingLateralPosition), and positive steering turns left,
        so drifting past the left edge must steer right (negative) and vice
-       versa. */
-    {
+       versa.
+
+       FIX (explicit instruction: MPPI/any override should only ever engage
+       for an actual on-road obstacle and the return-to-route afterward,
+       never merely for being close to the edge on its own). This used to
+       fire unconditionally, purely off tRoad, regardless of cause - the
+       exact "too close to edge" trigger this project has repeatedly been
+       told not to use. Gated on RecoveringFromObstacle (see
+       NeedsMppiEngagement above) so a road departure with no obstacle
+       behind it is left entirely to IPGDriver, same as everywhere else in
+       this file now. */
+    if (RecoveringFromObstacle) {
         const double leftGuardrailLimit = CurrentLeftRoadLimit - RoadEdgeGuardrailMargin;
         const double rightGuardrailLimit = CurrentRightRoadLimit - RoadEdgeGuardrailMargin;
         if (Vehicle.Road.Path.tRoad > leftGuardrailLimit) {
-            mppiRequestedSteering = -SteeringLimit;
+            const double excess = Vehicle.Road.Path.tRoad - leftGuardrailLimit;
+            const double rampFraction = Clamp(excess / EdgeGuardrailRampDistance, 0.0, 1.0);
+            mppiRequestedSteering = -EdgeGuardrailSteeringLimit * rampFraction;
             controllerMode = ControllerMode::EdgeGuardrail;
+            mppiIsActivelyCorrecting = true;
         } else if (Vehicle.Road.Path.tRoad < -rightGuardrailLimit) {
-            mppiRequestedSteering = SteeringLimit;
+            const double excess = -rightGuardrailLimit - Vehicle.Road.Path.tRoad;
+            const double rampFraction = Clamp(excess / EdgeGuardrailRampDistance, 0.0, 1.0);
+            mppiRequestedSteering = EdgeGuardrailSteeringLimit * rampFraction;
             controllerMode = ControllerMode::EdgeGuardrail;
+            mppiIsActivelyCorrecting = true;
         }
     }
 
     const double previousSteeringCommand = steeringCommand;
-    const double maximumSteeringStep = SteeringRateLimit * dt;
-    const double steeringError = mppiRequestedSteering - steeringCommand;
-    steeringCommand += Clamp(steeringError, -maximumSteeringStep, maximumSteeringStep);
+    if (mppiIsActivelyCorrecting) {
+        /* Only rate/acceleration-limit our OWN correction (MPPI's sampled
+           delta, a recovery nudge, or the guardrail) - that's the signal
+           that actually needs smoothing, since it can otherwise jump
+           discontinuously between updates. */
+        const double maximumSteeringStep = SteeringRateLimit * dt;
+        const double steeringError = mppiRequestedSteering - steeringCommand;
+        steeringCommand += Clamp(steeringError, -maximumSteeringStep, maximumSteeringStep);
+    } else {
+        /* FIX (explicit instruction, confirmed by testing: IPGDriver drives
+           this scenario correctly when our controller is fully bypassed,
+           but not when merely contributing zero delta through this
+           function). IPGDriver has its own internal steering-actuator
+           dynamics (Driver.Lat.StWhlAngleVelMax/AccMax in the TestRun,
+           far faster than SteeringRateLimit above) - applying OUR rate
+           limiter on top of that, even while adding nothing ourselves, is
+           a second, much slower actuator model IPGDriver never asked for.
+           At any single instant the two looked close in logged snapshots,
+           but the resulting PHASE LAG compounds into real trajectory error
+           over a fast maneuver (e.g. resuming a sharp turn from a stall).
+           With no obstacle involved, mirror ipgBaselineSteering exactly -
+           zero interference, matching MppiEnabled=false behavior. */
+        steeringCommand = ipgBaselineSteering;
+    }
     steeringCommand = Clamp(steeringCommand,
         -MaxAbsoluteSteeringCommand, MaxAbsoluteSteeringCommand);
 
@@ -1767,7 +1951,7 @@ User_VehicleControl_Calc(double dt)
     static bool first = true;
 
     if (first) {
-        Log("BUILD STAMP: ROLLOUT_VIZ_ROADYAW_V31 (built %s %s)\n", __DATE__, __TIME__);
+        Log("BUILD STAMP: ZERO_INTERFERENCE_PASSTHROUGH_V41 (built %s %s)\n", __DATE__, __TIME__);
         Log("User_VehicleControl_Calc() is running!");
         first = false;
     }
