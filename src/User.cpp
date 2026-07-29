@@ -217,7 +217,26 @@ NearestObstacleDy()
    ObstacleCost() and AnyCollisionRiskSensed() (see its lateral corridor
    gate below) can report/reason about the same resolved position, and so
    the diagnostic log can show it too instead of only the raw sensor
-   dx/dy. */
+   dx/dy.
+
+   FIX ("avoidance starts too late and overshoots on curved roads" task):
+   the single-rotation estimate above still assumes the road stays straight
+   (in whatever direction the vehicle currently points) for the entire
+   obstacle.dx ahead - correct on a straight road, increasingly wrong the
+   more the road curves over that distance, and obstacle.dx can be tens of
+   meters at speed (see CollisionRiskTimeToCollision). On a road curving
+   TOWARD the obstacle, this under-estimates how far into the corridor the
+   obstacle already is, so AnyCollisionRiskSensed()'s corridor gate doesn't
+   trigger until the obstacle is much closer than it should - not enough
+   room left for a smooth avoidance line, which is also why the return
+   swerve afterward has to be sharp enough to risk the far edge. Refine the
+   flat estimate above (kept as the fallback/search-hint) with a direct
+   query against the actual route geometry: rotate obstacle.dx/dy by the
+   vehicle's real WORLD heading (Vehicle.Yaw, not heading-relative-to-road)
+   to get the obstacle's true world (x,y), then ask RoadRouteEval to
+   resolve THAT point's real route-frame (s,t) - this follows the actual
+   curve between the vehicle and the obstacle exactly, however sharply it
+   bends, instead of assuming it doesn't. */
 void
 ObstacleAbsolutePosition(const Obstacle &obstacle, double &roadPosition, double &lateralPosition)
 {
@@ -229,6 +248,24 @@ ObstacleAbsolutePosition(const Obstacle &obstacle, double &roadPosition, double 
         obstacle.dx * sinReferenceHeading + obstacle.dy * cosReferenceHeading;
     roadPosition = SensorObstacleReferenceRoadDistance + obstacleRoadOffset;
     lateralPosition = SensorObstacleReferenceLateralPosition + obstacleLateralOffset;
+
+    if (MppiRoadEval == nullptr) {
+        return;
+    }
+
+    const double cosWorldYaw = cos(Vehicle.Yaw);
+    const double sinWorldYaw = sin(Vehicle.Yaw);
+    tRoadRouteIn rIn{};
+    tRoadRouteOut rOut{};
+    rIn.xyz[0] = Vehicle.Fr1A.t_0[0] + obstacle.dx * cosWorldYaw - obstacle.dy * sinWorldYaw;
+    rIn.xyz[1] = Vehicle.Fr1A.t_0[1] + obstacle.dx * sinWorldYaw + obstacle.dy * cosWorldYaw;
+    rIn.xyz[2] = 0.0;
+    rIn.st[0] = RoadEvaluationSOffset + roadPosition; /* search hint, per RIT_XY_S docs */
+    if (RoadRouteEval(MppiRoadEval, nullptr, RIT_XY_S, &rIn, &rOut) == ROAD_Ok
+        && std::isfinite(rOut.st[0]) && std::isfinite(rOut.st[1])) {
+        roadPosition = rOut.st[0] - RoadEvaluationSOffset;
+        lateralPosition = rOut.st[1];
+    }
 }
 
 constexpr double SteeringLimit = 15.0 * Pi / 180.0;      /* steering-wheel angle [rad] */
@@ -1951,7 +1988,7 @@ User_VehicleControl_Calc(double dt)
     static bool first = true;
 
     if (first) {
-        Log("BUILD STAMP: ZERO_INTERFERENCE_PASSTHROUGH_V41 (built %s %s)\n", __DATE__, __TIME__);
+        Log("BUILD STAMP: CURVATURE_AWARE_OBSTACLE_POSITION_V42 (built %s %s)\n", __DATE__, __TIME__);
         Log("User_VehicleControl_Calc() is running!");
         first = false;
     }
