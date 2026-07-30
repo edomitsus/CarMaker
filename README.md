@@ -43,6 +43,10 @@ actual simulation video. Produced with [`mppi_video_overlay.html`](mppi_video_ov
 
 https://github.com/user-attachments/assets/384111d6-dbfe-4369-9708-09a7ca11c355
 
+### Junction Road
+
+https://github.com/user-attachments/assets/20813c59-b2ff-45d6-b355-3eef1b75bc9c
+
 ### Simulator footage
 
 Raw CarMaker/MovieNX recording of the scenario, no overlay.
